@@ -28,6 +28,7 @@ function mapgen()
 
  repeat
   copymap(48,0)
+  init_borders()
   rooms={}
   roomap=blankmap(0)
   doors={}
@@ -40,7 +41,6 @@ function mapgen()
  carvescuts()
  startend()
  fillends()
- close_borders()
  prettywalls()
 
  installdoors()
@@ -119,6 +119,10 @@ function placeroom(r)
 end
 
 function doesroomfit(r,x,y)
+ -- disallow rooms that touch or cross the outer map border
+ if x<=0 or y<=0 or x+r.w-1>=MAP_W-1 or y+r.h-1>=MAP_H-1 then
+  return false
+ end
  for _x=-1,r.w do
   for _y=-1,r.h do
    if iswalkable(_x+x,_y+y) then
@@ -179,6 +183,8 @@ end
 
 function cancarve(x,y,walk)
  if not inbounds(x,y) then return false end
+ -- never carve on the outer border ring; keep it as solid wall
+ if x<=0 or y<=0 or x>=MAP_W-1 or y>=MAP_H-1 then return false end
  local walk= walk==nil and iswalkable(x,y) or walk
  
  if iswalkable(x,y)==walk then
@@ -334,17 +340,14 @@ function fillends()
     end
    end
   end
- until not filled
+ 	until not filled
 end
 
-function close_borders()
+function init_borders()
  for x=0,MAP_W-1 do
   for y=0,MAP_H-1 do
    if x==0 or y==0 or x==MAP_W-1 or y==MAP_H-1 then
-    local tle=mget(x,y)
-    if tle!=14 and tle!=15 then
-     mset(x,y,2)
-    end
+    mset(x,y,2)
    end
   end
  end
