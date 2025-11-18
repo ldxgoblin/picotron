@@ -22,6 +22,7 @@ local wm_pid = 3 -- Process ID of Picotron's window manager and info bar
 -- screen and world sizing
 SCREEN_W, SCREEN_H = 480, 270
 MAP_W, MAP_H       = 16, 16 -- logical dungeon size in tiles (must match current map resource)
+SHOW_FOG           = true   -- debug flag to toggle fog rendering
 
 -- global tile sizing (src tiles are 8x8, drawn as 32x32 on screen by default)
 TILE_SRC_SIZE = 8

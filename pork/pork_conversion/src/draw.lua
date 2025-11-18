@@ -6,9 +6,9 @@ function draw_game()
  if fadeperc==1 then return end
  animap()
 
- -- center camera on player in world pixels
- local px = p_mob.x*TILE_SIZE + TILE_SIZE/2
- local py = p_mob.y*TILE_SIZE + TILE_SIZE/2
+ -- center camera on the tweened player sprite in world pixels
+ local px = p_mob.x*TILE_SIZE + p_mob.ox + TILE_SIZE/2
+ local py = p_mob.y*TILE_SIZE + p_mob.oy + TILE_SIZE/2
  local camx = px - SCREEN_W/2
  local camy = py - SCREEN_H/2
  camera(camx + shake_x, camy + shake_y)
@@ -52,10 +52,12 @@ function draw_game()
   end
  end 
  
- for x=0,MAP_W-1 do
-  for y=0,MAP_H-1 do
-   if fog[x][y]==1 then
-    rectfill2(x*TILE_SIZE,y*TILE_SIZE,TILE_SIZE,TILE_SIZE,0)
+ if SHOW_FOG then
+  for x=0,MAP_W-1 do
+   for y=0,MAP_H-1 do
+    if fog[x][y]==1 then
+     rectfill2(x*TILE_SIZE,y*TILE_SIZE,TILE_SIZE,TILE_SIZE,0)
+    end
    end
   end
  end

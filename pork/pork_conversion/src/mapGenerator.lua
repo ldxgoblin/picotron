@@ -40,6 +40,7 @@ function mapgen()
  carvescuts()
  startend()
  fillends()
+ close_borders()
  prettywalls()
 
  installdoors()
@@ -334,6 +335,19 @@ function fillends()
    end
   end
  until not filled
+end
+
+function close_borders()
+ for x=0,MAP_W-1 do
+  for y=0,MAP_H-1 do
+   if x==0 or y==0 or x==MAP_W-1 or y==MAP_H-1 then
+    local tle=mget(x,y)
+    if tle!=14 and tle!=15 then
+     mset(x,y,2)
+    end
+   end
+  end
+ end
 end
 
 function isdoor(x,y)

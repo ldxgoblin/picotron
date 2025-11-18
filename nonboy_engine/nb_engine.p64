@@ -1,0 +1,4581 @@
+picotron cartridge // www.picotron.net
+version 2
+
+:: lib/
+:: lib/docs/
+:: src/
+:: src/procgen/
+:: src/procgen/dungeon/
+:: src/render/
+:: lib/ecs.lua
+--[[pod_format="raw",created="2024-04-07 18:38:25",modified="2024-05-10 01:34:49",revision=2161]]
+-- able's ECS framework v2.1
+
+ecs = {}
+
+-- BITMASK --
+
+-- Retrieves the bitmask bit for a given key in the world's component caches.
+-- world: The world object containing the component caches.
+-- key: key The key for which to retrieve the bitmask bit.
+-- Returns: The offset of the bit within the 64-bit integer and the index of that integer.
+local function get_bitmask_bit(world,key)
+	local id = world.comp_caches[key].id
+	return id%64,flr(id/64)+1
+end
+
+-- The metatable for bitmasks.
+local bitmask_meta = {
+	-- Adds a bit to the bitmask corresponding to the component.
+	-- key: Name of the component type.
+	add = function(self,key)
+		local bit,offset = get_bitmask_bit(self.world,key)
+		self[offset] = (self[offset] or 0)|(1<<bit)
+	end,
+	
+	-- Removes a bit from the bitmask corresponding to the component.
+	-- key: Name of the component type.
+	remove = function(self,key)
+		local bit,offset = get_bitmask_bit(self.world,key)
+		self[offset] = self[offset]&(~(1<<bit))
+	end,
+	
+	-- include: Bitmask of the components which must be included.
+	-- exclude: Bitmask of the components which must be excluded.
+	-- Returns: true if the bitmask satisifies the query.
+	match = function(self,include,exclude)
+		for i = 1,self.world.bitmask_size do
+			local include_num = include[i]
+			local exclude_num = exclude[i]
+			local self_num = self[i]
+			
+			if not (self_num&include_num == include_num
+				and self_num&exclude_num == 0)
+			then return false end
+		end
+		return true
+	end,
+}
+bitmask_meta.__index = bitmask_meta
+
+local function new_bitmask(world)
+	local o = {world = world}
+	for i = 1,world.bitmask_size do
+		o[i] = 0
+	end
+	setmetatable(o,bitmask_meta)
+	return o
+end
+
+-- ENTITIES --
+
+-- The metatable for the ref function on every entity.
+-- It makes the value reference in the ref weak, and allows calling
+-- the table to get the reference.
+local ref_meta = {
+	__mode = "v",
+	__call = function(self)
+		return self.entity and not self.entity.destroyed and self.entity
+	end
+}
+
+-- Creates and returns a new entity.
+-- world: The world where the entity will exist.
+-- Returns: The entity.
+local function ent(world)
+	local entity = {
+		world = world,
+		-- A map of all components on the entity.
+		-- Keys are component type names, values are components.
+		-- Can be used to fetch optional components or the components of
+		-- referenced entities during system execution.
+		comps = {},
+		-- Array of keys. Represents all components which need to be removed before
+		-- the next system call executes.
+		to_remove = {},
+		-- Bitmask of all components attached to this entity.
+		bitmask = new_bitmask(world),
+		destroyed = false,
+		
+		-- Adds a component to the entity. 
+		-- Calling a function created by `ecs.comp` will return both arguments at once.
+		-- comp: The component to add.
+		-- key: The name of the component type.
+		-- Returns: The entity, for chaining.
+		add = function(self,comp,key)
+			self.comps[key] = comp
+			self.world:update_query_cache(self,key)
+			self.bitmask:add(key)
+			
+			return self
+		end,
+		
+		-- Removes a component from the entity. Note that the act of removing it from
+		-- the `entity.comps` table is deferred until the next system execution call.
+		-- key: The name of the component type.
+		-- Returns: The entity, for chaining.
+		remove = function(self,key)
+			-- Deferred so data isn't removed in the middle of system execution.
+			add(self.to_remove,key)
+			self.world:update_query_cache(self,key)
+			self.bitmask:remove(key)
+			
+			return self
+		end,
+		
+		-- Queues the entity for destruction. Use this during system execution.
+		destroy = function(self)
+			add(self.world.entities_to_destroy,self)
+		end,
+		
+		-- Destroys the entity. Use this outside of system execution.
+		destroy_immediate = function(self)
+			-- This will remove the components from the systems' caches. Without it,
+			-- systems would keep executing on this entity's components.
+			for key in pairs(self.comps) do
+				self.world:update_query_cache(self,key)
+			end
+			
+			-- Maintains a dense array by replacing this entity's index with the last
+			-- entity in the array, and then removing the last entry.
+			local entities = self.world.entities
+			local index = self.index
+			local replacement = deli(entities)
+			replacement.index = index
+			entities[index] = replacement
+			
+			self.destroyed = true
+		end,
+		
+		-- Creates a weak reference to the entity.
+		-- Useful for referencing entities from other entities.
+		-- Returns: A callable table. When called, it will return the entity if 
+		-- it still exists, or nil if not.
+		ref = function(self)
+			local o = {entity = self}
+			setmetatable(o,ref_meta)
+			return o
+		end
+	}
+	
+	local entities = world.entities
+	add(entities,entity)
+	entity.index = #entities -- Used for fast deletion in the entities table.
+	
+	return entity
+end
+
+-- COMPONENTS --
+
+-- The metatable for components types.
+-- This allows the component to be called as its own constructor
+local comp_meta = {
+	__call = function(self,...)
+		return self.constructor(...),self.key
+	end,
+}
+
+-- Registers a component type with the world.
+-- world: The world object to register the component with.
+-- comp_type: The component type to register.
+-- Returns: The world object, for chaining.
+local function reg_comp(world,comp_type)
+	local comp_id_counter,max_components = world.comp_id_counter,world.max_components
+	if comp_id_counter >= max_components then
+		error("Cannot register more than "..max_components.." component types.")
+	end
+	
+	-- We want this key initialized ASAP, and we also wanna record the id somewhere
+	-- we can associate it with this component. Win win.
+	world.comp_caches[comp_type.key] = {id = comp_id_counter}
+	world.comp_id_counter += 1
+	
+	return world
+end
+
+-- Creates a new component type.
+-- [optional] world: The world object to register the component with.
+-- [optional] tab: The table to put the component in.
+-- key: The name of the component type.
+-- constructor: The function which creates a new instance of the component.
+-- Returns: A component type table which can be called to create new components.
+function ecs.comp(_a,_b,_c,_d)
+	-- world and tab are optional args.
+	local world,tab,key,constructor
+	if not _c then
+		world,tab,key,constructor = nil,nil,_a,_b
+	elseif not _d then
+		-- comp_id_counter is an indication of being a world table.
+		if world.comp_id_counter then
+			world,tab,key,constructor = _a,nil,_b,_c
+		else
+			world,tab,key,constructor = nil,_a,_b,_c
+		end
+	else
+		world,tab,key,constructor = _a,_b,_c,_d
+	end
+	
+	local output = {
+		key = key,
+		constructor = constructor,
+	}
+	-- Making it possible to call this table as if it were a function.
+	setmetatable(output,comp_meta)
+	if world then world:reg_comp(output) end
+	
+	-- So if you're putting it in a table, you don't have to write the key twice.
+	if tab then tab[key] = output end
+	-- But if you want, you can still get the function directly.
+	return output
+end
+
+-- SYSTEMS --
+
+-- Registers a system with the world.
+-- world: The world object to register the system with.
+-- system_data: The system data to register.
+-- Returns: The world object, for chaining.
+local function reg_sys(world,system_data)
+	-- Each system has a cache of entities which match the query.
+	-- To invalidate an entity in the cache, it is added to changed_entities.
+	local cache = {
+		changed_entities = {},
+		entities = {},
+	}
+	
+	local comp_caches = world.comp_caches
+	local include,exclude,func = system_data.include,system_data.exclude,system_data.func
+	
+	-- Cache some bitmasks so we can match entities quickly.
+	local include_bitmask = new_bitmask(world)
+	local exclude_bitmask = new_bitmask(world)
+	
+	-- Add the system's cache to each component's list of caches, and simultaneously
+	-- build the bitmasks for the query.
+	for key in all(include) do
+		local cache_list = comp_caches[key]
+		if not cache_list then
+			error("System includes component '"..key.."' which must be registered first.")
+		end
+		add(comp_caches[key],cache)
+		include_bitmask:add(key)
+	end
+	for key in all(exclude) do
+		local cache_list = comp_caches[key]
+		if not cache_list then
+			error("System includes component '"..key.."' which must be registered first.")
+		end
+		add(comp_caches[key],cache)
+		exclude_bitmask:add(key)
+	end
+	
+	local entity_result_index = #include+1 -- Why bother getting this more than once?
+	local results = {} -- We reuse this across query iterations.
+	-- Pulling double duty as the enumerator and the entity in the query.
+	local entity = nil
+	
+	-- All of this is basically just to wrap func so that it can do housekeeping
+	-- and receive the query iterator.
+	world.systems[system_data] = function()
+		-- First we go through and make sure the cache is up to date.
+		local matches = cache.entities
+		
+		for entity in pairs(cache.changed_entities) do
+			if entity.destroyed then
+				matches[entity] = nil
+			else
+				-- Clean up the entity's deleted components.
+				for key in all(entity.to_remove) do
+					entity.comps[key] = nil
+				end
+				entity.to_remove = {}
+				-- Recheck if entities that have changed match the query.
+				local match = entity.bitmask:match(include_bitmask,exclude_bitmask)
+				matches[entity] = match or nil
+			end
+		end
+		
+		cache.changed_entities = {}
+		
+		-- Then we execute func with the query iterator.
+		func(function()
+			entity = next(matches,entity)
+			if not entity then return end
+			
+			local comps = entity.comps
+			for i_comp,key in ipairs(include) do
+				results[i_comp] = comps[key]
+			end
+			results[entity_result_index] = entity
+			
+			return unpack(results)
+		end)
+		
+		-- And finally clean up any entities which were deleted during execution.
+		world:purge_entities()
+	end
+	
+	return world
+end
+
+-- Creates a new set of system data.
+-- [optional] world: The world object to register the system with.
+-- include: The components which entities must have to be included in the query.
+-- [optional] exclude: The components which entities must not have to be included in the query
+-- func: The function which processes receives the query and processes the entities.
+-- Returns: The system data.
+function ecs.sys(_a,_b,_c,_d)	
+	-- world and exclude are optional args
+	local world,include,exclude,func
+	if not _c then
+		world,include,exclude,func = nil,_a,{},_b
+	elseif not _d then
+		-- comp_id_counter is an indication of being a world table.
+		if _a.comp_id_counter then
+			world,include,exclude,func = _a,_b,{},_c
+		else
+			world,include,exclude,func = nil,_a,_b,_c
+		end
+	else
+		world,_include,exclude,func = _a,_b,_c,_d
+	end
+	
+	local system_data = {
+		include = include,
+		exclude = exclude,
+		func = func,
+	}
+	
+	if world then world:reg_sys(system_data) end
+	
+	return system_data
+end
+
+-- WORLDS --
+
+-- Creates a new world object.
+-- [optional] bitmask_size: The number of 64-bit integers to use for bitmasks. Default is 4.
+-- Higher values allow more components, but at a small performance cost.
+-- Returns: The world object.
+function ecs.world(bitmask_size)
+	-- By default this is 4, which means you can register up to 256 components.
+	bitmask_size = bitmask_size or 4
+	return {
+		-- The number of 64-bit integers to use for bitmasks.
+		bitmask_size = bitmask_size,
+		-- The maximum number of components which can be registered to this world.
+		max_components = bitmask_size*64,
+		
+		-- All active entities in the game
+		entities = {},
+		-- Array of all entities which have been requested to be destroyed.
+		entities_to_destroy = {},
+		
+		-- This table indicates which systems are interested in a particular component.
+		-- Keys are names of components, values are arrays of system caches.
+		comp_caches = {},
+		-- Each registered component increments this. It is used to create IDs for bitmasking.
+		comp_id_counter = 0,
+		
+		-- Keys are system data, values are the system functions.
+		systems = {},
+		
+		-- Executes a system for the world.
+		-- system_data: The system data to execute.
+		-- ...: Additional arguments to pass to the system.
+		-- Returns: The world object, for chaining.
+		run = function(self,system_data,...)
+			self.systems[system_data](...)
+			return self
+		end,
+
+		-- Tells each system which is interested in a particular component that an entity
+		-- has changed, and its query cache is out of date.
+		-- entity: The entity which has changed.
+		-- key: The name of the component which has changed.
+		update_query_cache = function(self,entity,key)
+			for cache in all(self.comp_caches[key]) do
+				cache.changed_entities[entity] = true
+			end
+		end,
+		
+		-- Destroys all entities which have been queued for destruction.
+		purge_entities = function(self)
+			for entity in all(self.entities_to_destroy) do
+				entity:destroy_immediate()
+			end
+			self.entities_to_destroy = {}
+		end,
+		
+		comp = ecs.comp,
+		sys = ecs.sys,
+		reg_comp = reg_comp,
+		reg_sys = reg_sys,
+		ent = ent,
+	}
+end
+:: lib/jsonParser.lua
+function init_json_reader()
+	J_WHITESPACE = {}
+	J_WHITESPACE[" "]=true
+	J_WHITESPACE["	"]=true
+	J_WHITESPACE[chr(10)]=true
+	J_WHITESPACE[chr(13)]=true
+
+	J_START_TABLE = "{"
+	J_STOP_TABLE="}"
+	J_START_LIST="["
+	J_STOP_LIST="]"
+	J_QUOTE="\""
+	J_COLON=":"
+	J_COMMA=","
+	J_OBJ_STARTS={
+		n=read_json_null,
+		t=read_json_true,
+		f=read_json_false,
+	}
+	J_OBJ_STARTS[J_QUOTE]=read_json_key_string
+	J_OBJ_STARTS[J_START_TABLE]=read_json_table
+	J_OBJ_STARTS[J_START_LIST]=read_json_list
+	J_OBJ_STARTS["-"]=read_json_number
+
+	for i = 0,9 do
+		J_OBJ_STARTS[tostr(i)] = read_json_number
+	end
+	json_init = true
+end
+
+function load_json_file(filepath)
+	-- Load and read a json file and return a list or table
+	if not json_init then init_json_reader() end
+	local text = fetch(filepath)
+	assert(text!=nil,"Failed to load json file: "..filepath)
+	return read_json(text)
+end
+
+function read_json(string)
+	if not json_init then init_json_reader() end
+	-- Read a json string and return a list or table.
+	if #string == 0 then
+		return nil
+	end
+
+	local i=skip_json_whitespace(string,1)
+
+	if string[i] == J_START_TABLE then
+		return read_json_table(string,i)
+	elseif string[i] == J_START_LIST then
+		return read_json_list(string,i)
+	else
+		assert(false,"Unexpected initial character encountered in json file: "..string[i])
+	end
+end
+
+function skip_json_whitespace(string,i)
+	-- Skip to the first non-whitespace character from position i
+	while J_WHITESPACE[string[i]] do
+		i+=1
+		assert(i<=#string,"Unexpectedly hit end of file while skipping whitespace\nin json file")
+	end
+	return i
+end
+
+function read_json_table(string,i)
+	local eot = false
+	local tab = {}
+	local k, v = nil, nil
+
+	if string[i]==J_START_TABLE then
+		i+=1
+	end
+
+	while not eot do
+		k, v, i = read_json_table_entry(string, i)
+		tab[k] = v
+		i = skip_json_whitespace(string,i)
+		if string[i]==J_COMMA then
+			i+=1
+		elseif string[i]==J_STOP_TABLE then
+			i+=1
+			eot=true
+		else
+			assert(
+				false,
+				"Unexpected character encounted after reading json entry with\nkey '"..tostr(k).."': "..tostr(string[i]).." "
+			)
+		end
+	end
+	return tab, i
+end
+
+function read_json_table_entry(string, i)
+	local k, v = nil, nil
+	i = skip_json_whitespace(string,i)
+	k, i = read_json_key_string(string,i)
+	i = skip_json_whitespace(string,i)
+	assert(
+		string[i] == J_COLON,
+		"Expected colon following json key '"..k.."', found: "..string[i]
+	)
+	i = skip_json_whitespace(string,i+1)
+	assert(
+		J_OBJ_STARTS[string[i]]!=nil,
+		"Unexpected value encounted while reading json entry\n'"..k.."', found: "..string[i]
+	)
+	v,i=J_OBJ_STARTS[string[i]](string,i)
+	return k, v, i
+end
+
+function read_json_key_string(string,i)
+	assert(
+		string[i]!=J_STOP_TABLE,
+		"Table ended while expecting entry, make sure you don't have a misplaced comma."
+	)
+	assert(
+		string[i]==J_QUOTE,
+		"Expected json key/string to start with double quote,\ninstead found: "..sub(string,i,i+10).."..."
+	)
+	i+=1
+
+	local s = i	
+
+	while string[i]!=J_QUOTE do
+		i+=1
+		assert(
+			i<=#string,
+			"Encountered end of json while reading key/string:\n"..sub(string,i,i+10).."..."
+		)
+	end
+	return sub(string,s,i-1), i+1
+end
+
+function read_json_list(string, i)
+	local eol = false
+	local lis = {}
+	local value = nil
+
+	if string[i]==J_START_LIST then
+		i+=1
+	end
+
+	while not eol do
+		i = skip_json_whitespace(string,i)
+		assert(
+			string[i]!=J_STOP_LIST,
+			"List ended while expecting entry, make sure you don't have a misplaced comma."
+		)
+		assert(
+			J_OBJ_STARTS[string[i]]!=nil,
+			"Unexpected value encounted while reading json list,\nfound: "..sub(string,i,i+10).."..."
+		)
+		value,i=J_OBJ_STARTS[string[i]](string,i)	
+
+		add(lis,value)
+
+		i = skip_json_whitespace(string,i)
+		if string[i]==J_COMMA then
+			i+=1
+		elseif string[i]==J_STOP_LIST then
+			i+=1
+			eol=true
+		else
+			assert(
+				false,
+				"Unexpected character encounted after reading json list entry: "..string[i]
+			)
+		end
+	end
+	return lis, i
+end
+
+function read_json_null(string,i)
+	assert(sub(string,i,i+3)=="null","Was expecting to read null during json file read, instead\nfound: "..sub(string,i,i+10).."...")
+	i+=4
+	return nil, i
+end
+
+function read_json_true(string,i)
+	assert(sub(string,i,i+3)=="true","Was expecting to read true during json file read, instead\nfound: "..sub(string,i,i+10).."...")
+	i+=4
+	return true, i
+end
+
+function read_json_false(string,i)
+	assert(sub(string,i,i+4)=="false","Was expecting to read false during json file read, instead\nfound: "..sub(string,i,i+10).."...")
+	i+=5
+	return false, i
+end
+
+function read_json_number(string,i)
+	local s = i
+
+	while not (
+		J_WHITESPACE[string[i]] or 
+		string[i]==J_COMMA or 
+		string[i]==J_STOP_TABLE or
+		string[i]==J_STOP_LIST
+	) do
+		i+=1
+		assert(i<=#string,"Unexpectedly hit the end of json string while reading a number.")
+	end
+
+	return tonum(sub(string,s,i-1)), i
+end
+:: lib/log.lua
+--[[pod_format="raw",created="2024-09-08 16:18:39",modified="2024-09-08 22:44:14",revision=1]]
+--[[
+	log.lua - logging and tracing
+	(c) 2024 Andrew Vasilyev. All rights reserved.
+
+	This program is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	This program is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with this program. If not, see <https://www.gnu.org/licenses/>.
+]]
+
+local log = {}
+
+-- Log levels table
+log.levels = {
+	TRACE = 1,
+	DEBUG = 2,
+	INFO  = 3,
+	WARN  = 4,
+	ERROR = 5
+}
+
+-- Log level color codes for console output
+local log_level_colors = {
+	"\f6", -- TRACE
+	"\f7", -- DEBUG
+	"\fb", -- INFO
+	"\fa", -- WARN
+	"\f8"  -- ERROR
+}
+
+-- Log output targets
+log.targets = {
+	CONSOLE = 1,         -- Logs to console
+	EXTERNAL_PROCESS = 2 -- Logs to an external process
+}
+
+-- Current log level (default to INFO)
+log.current_level = log.levels.INFO
+
+-- Default log target (set to external process)
+log.target = log.targets.EXTERNAL_PROCESS
+log.target_process_name = "logview" -- Name of external process
+log.target_process_id = -1          -- Process ID of the log target
+
+-- Formats a timestamp into MM:SS.mmm format
+local function format_timestamp(timestamp)
+	local minutes = math.floor(timestamp / 60)
+	local seconds = math.floor(timestamp % 60)
+	local milliseconds = math.floor((timestamp % 1) * 1000)
+	return string.format("%02d:%02d.%03d", minutes, seconds, milliseconds)
+end
+
+-- Formats a log entry with level color, timestamp, and message
+local function format_log_entry(level, timestamp, message)
+	return log_level_colors[level] .. format_timestamp(timestamp) .. "\t" .. message
+end
+
+-- Logs a message if it meets the current log level
+local function log_message(level, message, ...)
+	if level < log.current_level then
+		return
+	end
+
+	if log.target == log.targets.EXTERNAL_PROCESS and log.target_process_id == -1 then
+		-- Logging target process ID not resolved. Unable to log message.
+		return
+	end
+
+	local formatted_message = string.format(message, ...)
+	local timestamp = time()
+
+	local presentation = format_log_entry(level, timestamp, formatted_message)
+
+	if log.target == log.targets.EXTERNAL_PROCESS then
+		send_message(log.target_process_id, {
+			event = "entry",
+			entry = {
+				timestamp = timestamp,
+				level = level,
+				message = formatted_message
+			},
+			presentation = presentation
+		})
+	elseif log.target == log.targets.CONSOLE then
+		print(presentation)
+	end
+end
+
+-- Initializes the logging system and resolves the external process ID
+function log.init()
+	if log.target == log.targets.EXTERNAL_PROCESS then
+		log.target_process_id = get_pid_by_name(log.target_process_name)
+		if log.target_process_id == -1 then
+			log.set_target(log.targets.CONSOLE)
+			log.warn("External logging process '" .. log.target_process_name .. "' not found. Defaulting to console output...")
+		end
+	end
+end
+
+-- Logs function entry and exit points for tracing
+function log.trace_function(fn_name, fn, ...)
+	log.trace("Entering %s()", fn_name)
+	local result = { fn(...) }
+	log.trace("Exiting %s()", fn_name)
+	return table.unpack(result)
+end
+
+-- Log message functions for different levels
+function log.trace(message, ...) log_message(log.levels.TRACE, message, ...) end
+
+function log.debug(message, ...) log_message(log.levels.DEBUG, message, ...) end
+
+function log.info(message, ...) log_message(log.levels.INFO, message, ...) end
+
+function log.warn(message, ...) log_message(log.levels.WARN, message, ...) end
+
+function log.error(message, ...) log_message(log.levels.ERROR, message, ...) end
+
+-- Sets the current logging level
+function log.set_level(level)
+	log.current_level = level
+end
+
+-- Sets the logging target and optionally updates the external process name
+function log.set_target(target_type, process_name)
+	log.target = target_type
+
+	if process_name then
+		log.target_process_name = process_name
+		log.target_process_id = -1
+	end
+end
+
+return log
+
+:: lib/require.lua
+--[[pod_format="raw",created="2024-09-08 09:50:21",modified="2025-03-07 13:16:28",revision=8]]
+--[[
+	require.lua - Lua 5.4-compatible "require"
+	(c) 2025 Andrew Vasilyev. All rights reserved.
+
+	This program is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	This program is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with this program. If not, see <https://www.gnu.org/licenses/>.
+]]
+
+-- Retrieves the current folder of the calling script
+local function get_current_folder()
+	local str = debug.getinfo(2, "S").source:sub(2)
+	return str:match("(.*/)")
+end
+
+-- Attempts to resolve the full path of a module.
+-- Adds ".lua" extension if necessary.
+-- @param path: The path to the module
+-- @return: The full path of the module
+local function resolve_module_path(path)
+	if not path:match("%.lua$") then
+		return fullpath(path .. ".lua")
+	end
+	return fullpath(path)
+end
+
+-- Table to cache loaded modules to avoid reloading
+local _LOADED = {}
+
+-- Holds all the paths to search for modules
+local _PATH = { get_current_folder() }
+
+-- Adds a new path to the module search path
+-- @param path: The new path to be added
+function add_module_path(path)
+	table.insert(_PATH, path)
+end
+
+-- Clears all loaded modules from the cache, with an option to preserve specific modules.
+-- This allows modules to be reloaded upon the next `require()` call, except for those marked as preserved.
+-- Useful for reloading modules during testing or debugging, while retaining essential ones like log utilities.
+-- @param preserved: (Optional) A list of module names to preserve in the cache (e.g., {"log", "config"}).
+function clear_module_cache(preserved)
+	-- Iterate through the loaded modules cache (_LOADED)
+	for module_name, _ in pairs(_LOADED) do
+		local preserve = false  -- Flag to determine if the module should be preserved
+
+		-- Check if the module is in the list of preserved modules
+		if preserved then
+			for _, preserve_name in pairs(preserved) do
+				if module_name == preserve_name then
+					preserve = true
+					break  -- No need to check further if the module is already marked to preserve
+				end
+			end
+		end
+
+		-- If the module is not in the preserved list, remove it from the cache
+		if not preserve then
+			_LOADED[module_name] = nil
+		end
+	end
+end
+
+-- Loads and caches a Lua module, similar to the `require()` function.
+-- If the module is already cached, it returns the cached version.
+-- Otherwise, it resolves the module's path, fetches, compiles, and executes it.
+-- The `alias` parameter allows you to load an alternative (mock) implementation
+-- instead of the real module.
+-- @param filename: The name of the Lua module to load.
+-- @param alias: (Optional) An alternative name to use for caching or loading a mock module.
+-- @return: The result of the module's execution, typically a table containing functions or data.
+function require(filename, alias)
+	local full_filename, src
+	local key = filename
+
+	if alias then
+		key = alias
+	end
+
+	if _LOADED[key] then
+		return _LOADED[key]
+	end
+
+	for _, path in ipairs(_PATH) do
+		full_filename = resolve_module_path(path .. filename)
+
+		src = fetch(full_filename)
+
+		if type(src) == "string" then
+			local func, err = load(src, "@" .. full_filename, "t", _ENV)
+
+			if not func then
+				wtf("Error loading module '" .. filename .. "': " .. err)
+				return
+			end
+
+			_LOADED[key] = func() or true
+			return _LOADED[key]
+		end
+	end
+
+	wtf("Module '" .. filename .. "' not found in search paths.")
+end
+
+:: lib/ui.lua
+-- Observable class: Manages a value and notifies observers when it changes
+Observable = {}
+Observable.__index = Observable
+
+-- Creates a new Observable instance with an initial value
+function Observable:new(value)
+    local o = {
+        value = value,   -- Stores the current value
+        observers = {}   -- List of observers to notify on value change
+    }
+    setmetatable(o, self)
+    return o
+end
+
+-- Sets a new value and notifies all observers of the change
+function Observable:set(value)
+    self.value = value  -- Update the internal value
+    self:notify()       -- Notify observers that the value has changed
+end
+
+-- Gets the current value of the observable
+function Observable:get()
+    return self.value   -- Return the stored value
+end
+
+-- Registers an observer function to be notified when the value changes
+function Observable:observe(observer)
+    table.insert(self.observers, observer) -- Add the observer to the list
+end
+
+-- Notifies all registered observers by calling their functions with the updated value
+function Observable:notify()
+    for _, observer in ipairs(self.observers) do
+        observer(self.value)  -- Call each observer with the current value
+    end
+end
+
+-- Base class for concrete view components, managing view properties and behavior
+ConcreteViewClass = {}
+ConcreteViewClass.__index = ConcreteViewClass
+
+-- Creates a new view component with optional properties
+function ConcreteViewClass:new(props)
+    local o = {}
+    setmetatable(o, self)
+    o._boundProperties = {}  -- Keeps track of properties bound to observables
+    props = props or {}
+    o:bindUniversalProperties(props) -- Bind universal view properties
+    o:update()                       -- Trigger update to initialize view
+    return o
+end
+
+-- Binds universal properties (padding, border, background color, etc.)
+function ConcreteViewClass:bindUniversalProperties(props)
+    -- Universal properties that apply to all view components
+    self:bindProperty("padding_x", props.padding_x or 0)
+    self:bindProperty("padding_y", props.padding_y or 0)
+    self:bindProperty("border_x", props.border_x or 0)
+    self:bindProperty("border_y", props.border_y or 0)
+    self:bindProperty("background_color", props.background_color)
+    self:bindProperty("border_color", props.border_color)
+end
+
+-- Binds a property to an observable or sets a static value
+function ConcreteViewClass:bindProperty(propName, value)
+    if type(value) == "table" and value.observe then
+        -- If the value is observable, bind and update the property when it changes
+        self[propName] = value:get() -- Initialize with the current value
+        value:observe(function(new_value)
+            self[propName] = new_value -- Update property with new value
+            self:update()              -- Redraw the component
+        end)
+        table.insert(self._boundProperties, propName) -- Track bound properties
+    else
+        -- Static value: set the property directly
+        self[propName] = value
+    end
+end
+
+-- Placeholder function to be implemented by subclasses for updating the view
+function ConcreteViewClass:update()
+    -- To be implemented by subclasses
+end
+
+-- Calculates and returns the width of the view including padding and border
+function ConcreteViewClass:width()
+    local width = self._width or 0
+    width = width + 2 * (self.padding_x or 0) + 2 * (self.border_x or 0) -- Add padding and border
+    return width
+end
+
+-- Calculates and returns the height of the view including padding and border
+function ConcreteViewClass:height()
+    local height = self._height or 0
+    height = height + 2 * (self.padding_y or 0) + 2 * (self.border_y or 0) -- Add padding and border
+    return height
+end
+
+-- Draws the view, including the border and background, and calls drawContent for specific content
+function ConcreteViewClass:draw()
+    return function(x, y)
+        local bx = self.border_x or 0
+        local by = self.border_y or 0
+        local px = self.padding_x or 0
+        local py = self.padding_y or 0
+
+        -- Draw the border if defined
+        if self.border_color then
+            rectfill(x, y, x + self:width() - 1, y + self:height() - 1, self.border_color)
+        end
+
+        -- Draw the background if defined
+        if self.background_color then
+            local bg_x = x + bx
+            local bg_y = y + by
+            local bg_w = self:width() - 2 * bx
+            local bg_h = self:height() - 2 * by
+            rectfill(bg_x, bg_y, bg_x + bg_w - 1, bg_y + bg_h - 1, self.background_color)
+        end
+
+        -- Draw the content inside the view
+        local content_x = x + bx + px
+        local content_y = y + by + py
+        self:drawContent()(content_x, content_y) -- Call drawContent to render specific content
+    end
+end
+
+-- Placeholder function to be implemented by subclasses for drawing content
+function ConcreteViewClass:drawContent()
+    return function(x, y)
+        -- Placeholder function for content
+    end
+end
+
+-- ViewClass serves as a base for composite views that can hold child views
+ViewClass = {}
+ViewClass.__index = ViewClass
+
+-- Creates a new composite view with optional properties
+function ViewClass:new(props)
+    local o = {}
+    setmetatable(o, self)
+    o.children = {}          -- List to store child views
+    o._boundProperties = {}   -- Keeps track of bound properties
+    props = props or {}
+    o:bindUniversalProperties(props) -- Bind universal properties
+    o:update()                      -- Trigger update to layout the view
+    return o
+end
+
+-- Binds universal properties for composite views
+function ViewClass:bindUniversalProperties(props)
+    self:bindProperty("padding_x", props.padding_x or 0)
+    self:bindProperty("padding_y", props.padding_y or 0)
+    self:bindProperty("border_x", props.border_x or 0)
+    self:bindProperty("border_y", props.border_y or 0)
+    self:bindProperty("background_color", props.background_color)
+    self:bindProperty("border_color", props.border_color)
+    self:bindProperty("spacing", props.spacing or 0) -- Spacing between child views
+end
+
+-- Binds a property, similar to ConcreteViewClass
+function ViewClass:bindProperty(propName, value)
+    if type(value) == "table" and value.observe then
+        self[propName] = value:get()
+        value:observe(function(new_value)
+            self[propName] = new_value
+            self:update()
+        end)
+        table.insert(self._boundProperties, propName)
+    else
+        self[propName] = value
+    end
+end
+
+-- Appends a child view to the composite view
+function ViewClass:append(v)
+    table.insert(self.children, v) -- Add child view to the list of children
+end
+
+-- Placeholder function to be implemented by subclasses for updating the view layout
+function ViewClass:update()
+    -- To be implemented by subclasses
+end
+
+-- Calculates and returns the width of the composite view, accounting for children
+function ViewClass:width()
+    local width = self._width or 0
+    width = width + 2 * (self.padding_x or 0) + 2 * (self.border_x or 0) -- Add padding and border
+    return width
+end
+
+-- Calculates and returns the height of the composite view, accounting for children
+function ViewClass:height()
+    local height = self._height or 0
+    height = height + 2 * (self.padding_y or 0) + 2 * (self.border_y or 0) -- Add padding and border
+    return height
+end
+
+-- Draws the composite view and its child views
+function ViewClass:draw()
+    return function(x, y)
+        local bx = self.border_x or 0
+        local by = self.border_y or 0
+        local px = self.padding_x or 0
+        local py = self.padding_y or 0
+
+        -- Draw the border if defined
+        if self.border_color then
+            rectfill(x, y, x + self:width() - 1, y + self:height() - 1, self.border_color)
+        end
+
+        -- Draw the background if defined
+        if self.background_color then
+            local bg_x = x + bx
+            local bg_y = y + by
+            local bg_w = self:width() - 2 * bx
+            local bg_h = self:height() - 2 * by
+            rectfill(bg_x, bg_y, bg_x + bg_w - 1, bg_y + bg_h - 1, self.background_color)
+        end
+
+        -- Draw content, including children
+        local content_x = x + bx + px
+        local content_y = y + by + py
+        self:drawContent()(content_x, content_y) -- Draw child views or content
+    end
+end
+
+-- Placeholder function for drawing content, implemented by subclasses
+function ViewClass:drawContent()
+    return function(x, y)
+        -- Placeholder for subclasses
+    end
+end
+
+-- TextViewClass displays text within a view
+TextViewClass = {}
+TextViewClass.__index = TextViewClass
+setmetatable(TextViewClass, {__index = ConcreteViewClass})
+
+-- Creates a new TextViewClass with text and color properties
+function TextViewClass:new(props)
+    local o = ConcreteViewClass:new(props) -- Call base class constructor
+    setmetatable(o, self)
+    props = props or {}
+    o:bindProperty("text", props.text or "")   -- Bind text property
+    o:bindProperty("color", props.color or 7)  -- Bind color property
+    -- Bind any additional properties passed in props
+    for k, v in pairs(props) do
+        if k ~= "text" and k ~= "color" then
+            o:bindProperty(k, v)
+        end
+    end
+    o:update() -- Trigger update to adjust dimensions
+    return o
+end
+
+-- Updates text view dimensions based on text length
+function TextViewClass:update()
+    self._width = #(self.text or "") * 5  -- Assume 5 pixels per character
+    self._height = 8  -- Assume fixed height of 8 pixels for text
+end
+
+-- Draws the text content inside the view
+function TextViewClass:drawContent()
+    return function(x, y)
+        clip(x, y, x + self._width, y + self._height) -- Clip to view dimensions
+        print(self.text, x, y, self.color)            -- Draw the text
+        clip()                                        -- Reset clipping
+    end
+end
+
+-- Text component helper function to create TextViewClass instances
+function Text(children)
+    return function(props)
+        local text = children[1] -- Use the first child as the text
+        props = props or {}
+        props.text = text         -- Set the text property
+        local o = TextViewClass:new(props) -- Create new TextViewClass instance
+        return o
+    end
+end
+
+-- VStackClass: Arranges child views vertically with optional spacing and alignment
+VStackClass = {}
+VStackClass.__index = VStackClass
+setmetatable(VStackClass, {__index = ViewClass})
+
+function VStackClass:new(props)
+    local o = ViewClass:new(props)
+    setmetatable(o, self)
+    -- Accept 'align' property with default 'left'
+    o:bindProperty("align", props.align or "left")
+    o:update()
+    return o
+end
+
+function VStackClass:update()
+    self._width = 0
+    self._height = 0
+    local total_spacing = self.spacing * math.max(0, #self.children - 1)
+
+    -- Update children and determine stack dimensions
+    for _, child in ipairs(self.children) do
+        child:update()
+        self._width = math.max(self._width, child:width())
+        self._height = self._height + child:height()
+    end
+    self._height = self._height + total_spacing
+end
+
+function VStackClass:drawContent()
+    return function(x, y)
+        local current_y = y
+        for _, child in ipairs(self.children) do
+            local draw_func = child:draw()
+            local child_width = child:width()
+            local offset_x = 0
+
+            -- Adjust x-position based on alignment
+            if self.align == "center" then
+                offset_x = (self._width - child_width) / 2
+            elseif self.align == "right" then
+                offset_x = self._width - child_width
+            elseif self.align == "left" then
+                offset_x = 0
+            else
+                -- Default to 'left' alignment
+                offset_x = 0
+            end
+
+            draw_func(x + offset_x, current_y)
+            current_y = current_y + child:height() + self.spacing
+        end
+    end
+end
+
+function VStack(children)
+    return function(props)
+        local o = VStackClass:new(props)
+        for _, child in ipairs(children) do
+            o:append(child)
+        end
+        return o
+    end
+end
+
+-- HStackClass: Arranges child views horizontally with optional spacing and alignment
+HStackClass = {}
+HStackClass.__index = HStackClass
+setmetatable(HStackClass, {__index = ViewClass})
+
+function HStackClass:new(props)
+    local o = ViewClass:new(props)
+    setmetatable(o, self)
+    -- Accept 'align' property with default 'top'
+    o:bindProperty("align", props.align or "top")
+    o:update()
+    return o
+end
+
+function HStackClass:update()
+    self._width = 0
+    self._height = 0
+    local total_spacing = self.spacing * math.max(0, #self.children - 1)
+
+    -- Update children and determine stack dimensions
+    for _, child in ipairs(self.children) do
+        child:update()
+        self._width = self._width + child:width()
+        self._height = math.max(self._height, child:height())
+    end
+    self._width = self._width + total_spacing
+end
+
+function HStackClass:drawContent()
+    return function(x, y)
+        local current_x = x
+        for _, child in ipairs(self.children) do
+            local draw_func = child:draw()
+            local child_height = child:height()
+            local offset_y = 0
+
+            -- Adjust y-position based on alignment
+            if self.align == "center" then
+                offset_y = (self._height - child_height) / 2
+            elseif self.align == "bottom" then
+                offset_y = self._height - child_height
+            elseif self.align == "top" then
+                offset_y = 0
+            else
+                -- Default to 'top' alignment
+                offset_y = 0
+            end
+
+            draw_func(current_x, y + offset_y)
+            current_x = current_x + child:width() + self.spacing
+        end
+    end
+end
+
+function HStack(children)
+    return function(props)
+        local o = HStackClass:new(props)
+        for _, child in ipairs(children) do
+            o:append(child)
+        end
+        return o
+    end
+end
+:: main.lua
+--[[pod_format="raw",created="2024-09-08 09:50:07",modified="2025-03-07 13:16:33",revision=5]]
+--[[
+	main.lua - program entry point
+]]
+
+include("lib/require.lua")
+include("lib/ui.lua")
+
+add_module_path("lib/")
+add_module_path("src/")
+
+include("src/globals.lua")
+include("src/configuration.lua")
+
+local log = require("log")
+local dungeon_factory = require("procgen.dungeon_factory")
+local dungeon_map_renderer = require("render.dungeon_map_renderer")
+
+-- simple UI button built on ConcreteViewClass
+local ButtonClass = {}
+ButtonClass.__index = ButtonClass
+setmetatable(ButtonClass, { __index = ConcreteViewClass })
+
+local ui_state = {
+	buttons = {},
+	root = nil,
+	root_position = { x = 258, y = 8 },
+	mouse_down = false,
+	status_text = Observable:new("Ready"),
+	seed_text = Observable:new("-"),
+	rooms_text = Observable:new("-"),
+	objects_text = Observable:new("-"),
+	log_status = Observable:new("log target: initialising"),
+	theme_text = Observable:new("random"),
+	theme_names = {},
+	theme_index = 1
+}
+
+local function register_button(button)
+	table.insert(ui_state.buttons, button)
+end
+
+function ButtonClass:new(props)
+	props = props or {}
+	local label = props.text or props.label or "Button"
+	local on_click = props.on_click
+	props.on_click = nil
+	props.padding_x = props.padding_x or 4
+	props.padding_y = props.padding_y or 3
+	props.background_color = props.background_color or 1
+	props.border_color = props.border_color or 6
+	props.color = props.color or 7
+	local o = ConcreteViewClass:new(props)
+	setmetatable(o, self)
+	o:bindProperty("text", label)
+	o:bindProperty("color", props.color)
+	o:on_click(on_click)
+	register_button(o)
+	o:update()
+	return o
+end
+
+function ButtonClass:on_click(handler)
+	self._click_handler = handler
+end
+
+function ButtonClass:update()
+	local label = tostring(self.text or "")
+	self._width = math.max(32, #label * 4 + 12)
+	self._height = 14
+end
+
+function ButtonClass:draw()
+	local draw_fn = ConcreteViewClass.draw(self)
+	return function(x, y)
+		self._last_x = x
+		self._last_y = y
+		self._last_w = self:width()
+		self._last_h = self:height()
+		draw_fn(x, y)
+	end
+end
+
+function ButtonClass:drawContent()
+	return function(x, y)
+		local label = tostring(self.text or "")
+		local text_x = x + math.floor((self._width - #label * 4) / 2)
+		local text_y = y + math.floor((self._height - 6) / 2)
+		clip(x, y, x + self._width, y + self._height)
+		print(label, text_x, text_y, self.color or 7)
+		clip()
+	end
+end
+
+function ButtonClass:hit_test(mx, my)
+	if not self._last_x then return false end
+	return mx >= self._last_x and mx <= self._last_x + self._last_w and my >= self._last_y and my <= self._last_y + self._last_h
+end
+
+function ButtonClass:trigger()
+	if self._click_handler then
+		self._click_handler()
+	end
+end
+
+local function Button(props)
+	return ButtonClass:new(props)
+end
+
+local function build_theme_list()
+	local names = { "random" }
+	for name in pairs(themes) do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	return names
+end
+
+local function set_theme_index(idx)
+	if #ui_state.theme_names == 0 then return end
+	if idx < 1 then idx = #ui_state.theme_names end
+	if idx > #ui_state.theme_names then idx = 1 end
+	ui_state.theme_index = idx
+	ui_state.theme_text:set(ui_state.theme_names[idx])
+end
+
+local function cycle_theme()
+	set_theme_index(ui_state.theme_index + 1)
+end
+
+local function current_theme_selection()
+	local name = ui_state.theme_names[ui_state.theme_index]
+	if name == "random" then return nil end
+	return name
+end
+
+local function refresh_world_snapshot()
+	local world = dungeon_factory.current()
+	if world and world.gen_stats then
+		local stats = world.gen_stats
+		ui_state.seed_text:set(tostring(stats.seed or "-"))
+		ui_state.rooms_text:set(tostring(stats.rooms or "-"))
+		ui_state.objects_text:set(tostring(stats.objects or "-"))
+	else
+		ui_state.seed_text:set("-")
+		ui_state.rooms_text:set("-")
+		ui_state.objects_text:set("-")
+	end
+end
+
+local function ensure_logview_process()
+	if not configuration.log.enabled then
+		ui_state.log_status:set("logging disabled")
+		return false
+	end
+	if log.target ~= log.targets.EXTERNAL_PROCESS then
+		ui_state.log_status:set("log target: console")
+		return false
+	end
+	if log.target_process_id and log.target_process_id ~= -1 then
+		ui_state.log_status:set("log viewer connected")
+		return true
+	end
+	if not run then
+		ui_state.log_status:set("start src/logview.lua manually")
+		return false
+	end
+	local ok, err = pcall(function()
+		run("src/logview.lua")
+	end)
+	if not ok then
+		ui_state.log_status:set("logview launch failed")
+		log.warn("Unable to launch log viewer: %s", tostring(err))
+		return false
+	end
+	log.init()
+	ui_state.log_status:set("log viewer launching...")
+	return true
+end
+
+local function open_log_viewer()
+	if ensure_logview_process() then
+		ui_state.log_status:set("log viewer requested")
+	end
+end
+
+local function attempt_generate()
+	ui_state.status_text:set("Generating...")
+	local selected_theme = current_theme_selection()
+	local ok, err = pcall(function()
+		local opts = {}
+		if selected_theme then
+			opts.theme = selected_theme
+		end
+		dungeon_factory.generate(opts)
+	end)
+	if not ok then
+		local message = tostring(err)
+		ui_state.status_text:set("Error: " .. message)
+		log.error("Generation failed: %s", message)
+		return
+	end
+	refresh_world_snapshot()
+	ui_state.status_text:set(string.format("Generated (%s)", selected_theme or "random"))
+end
+
+local function build_stats_row(label, observable)
+	return HStack({
+		Text({ label })({ color = 6 }),
+		Text({})({ text = observable, color = 7 })
+	})({ spacing = 4, align = "left" })
+end
+
+local function build_ui()
+	local header = Text({ "Dungeon Generation Harness" })({ color = 11 })
+	local status_row = HStack({
+		Text({ "Status:" })({ color = 6 }),
+		Text({})({ text = ui_state.status_text, color = 7 })
+	})({ spacing = 4 })
+
+	local stats_stack = VStack({
+		build_stats_row("Seed", ui_state.seed_text),
+		build_stats_row("Rooms", ui_state.rooms_text),
+		build_stats_row("Objects", ui_state.objects_text)
+	})({ spacing = 2 })
+
+	local theme_row = HStack({
+		Text({ "Theme:" })({ color = 6 }),
+		Text({})({ text = ui_state.theme_text, color = 7 }),
+		Button({ text = "Next" , on_click = cycle_theme, background_color = 2, border_color = 12 })
+	})({ spacing = 6, align = "center" })
+
+	local control_buttons = HStack({
+		Button({ text = "Generate", on_click = attempt_generate, background_color = 3, border_color = 12 }),
+		Button({ text = "Open Log Viewer", on_click = open_log_viewer, background_color = 1, border_color = 12 })
+	})({ spacing = 6, align = "top" })
+
+	local log_row = Text({})({ text = ui_state.log_status, color = 5 })
+	local instructions = Text({ "Use mouse to click buttons. 'Generate' will rebuild the dungeon." })({ color = 5 })
+
+	ui_state.root = VStack({ header, status_row, stats_stack, theme_row, control_buttons, log_row, instructions })({
+		spacing = 6,
+		padding_x = 6,
+		padding_y = 6,
+		border_color = 1,
+		background_color = 0
+	})
+end
+
+local function handle_mouse_input()
+	local mx, my, buttons = mouse()
+	mx, my, buttons = mx or 0, my or 0, buttons or 0
+	local left_down = bit32.band(buttons, 0x1) ~= 0
+	if left_down and not ui_state.mouse_down then
+		for _, button in ipairs(ui_state.buttons) do
+			if button:hit_test(mx, my) then
+				button:trigger()
+				break
+			end
+		end
+	end
+	ui_state.mouse_down = left_down
+end
+
+if configuration.log.enabled then
+	log.set_level(configuration.log.level)
+	log.init()
+end
+
+-- Main initialization function
+-- Called once when the program starts
+function _init()
+	log.info("Initializing application...")
+
+	ui_state.theme_names = build_theme_list()
+	set_theme_index(1)
+	build_ui()
+	refresh_world_snapshot()
+	ensure_logview_process()
+
+	local success, err = pcall(function()
+		dungeon_factory.init()
+		dungeon_factory.generate({ theme = current_theme_selection() })
+	end)
+
+	if not success then
+		wtf(tostring(err))
+	end
+
+	refresh_world_snapshot()
+	ui_state.status_text:set("Ready")
+	log.info("Application initialized successfully.")
+end
+
+-- Main update function
+-- Called every frame to update the program's state
+function _update()
+	log.trace("> Entering _update()")
+
+	local success, err = pcall(function()
+		handle_mouse_input()
+		if ui_state.root and ui_state.root.update then
+			ui_state.root:update()
+		end
+	end)
+
+	if not success then
+		log.error("Error during update: " .. tostring(err))
+	end
+
+	log.trace("< Exiting _update()")
+end
+
+-- Main draw function
+-- Called every frame to render visuals to the screen
+function _draw()
+	log.trace("> Entering _draw()")
+
+	local success, err = pcall(function()
+		cls(0)
+		local world = dungeon_factory.current()
+		if world then
+			dungeon_map_renderer.draw(world, {
+				x = 8,
+				y = 8,
+				max_width = 240,
+				max_height = 240
+			})
+		else
+			print("no dungeon generated", 8, 8, 8)
+		end
+
+		if ui_state.root then
+			local draw_fn = ui_state.root:draw()
+			draw_fn(ui_state.root_position.x, ui_state.root_position.y)
+		end
+	end)
+
+	if not success then
+		log.error("Error during draw: " .. tostring(err))
+	end
+
+	log.trace("< Exiting _draw()")
+end
+
+:: src/configuration.lua
+--[[pod_format="raw",created="2024-09-08 09:49:19",modified="2025-03-07 13:16:06",revision=6]]
+
+local log = require("log", "log")
+
+configuration = {
+	-- If true, logging will be initialized and messages will be sent to the "logview" process
+	log = {
+		-- If true, logging will be enabled
+		enabled = true,
+		-- The logging level to use
+		level = log.levels.DEBUG
+	}
+}
+
+--[[pod_format="raw",created="2025-11-07 21:17:14",modified="2025-11-07 21:48:05",revision=1]]
+-- engine configuration
+
+-- world grid
+map_size=128
+objgrid_size=5
+objgrid_array_size=26
+
+-- sprite configuration
+sprite_size=32
+
+-- ai and interaction constants
+ai_update_rate=2 -- frames between AI updates
+interaction_range=0.5 -- proximity for triggers
+combat_trigger_range=0.3 -- distance to trigger combat
+
+-- player movement constants
+player_rotation_speed=0.008 -- radians per frame when turning (slower, smoother)
+player_move_speed=0.04 -- units per frame when moving (reduced)
+
+-- door animation constants
+door_anim_speed=0.06 -- door open/close speed per frame
+door_close_delay=90 -- frames before door auto-closes
+
+-- floor/ceiling types (tex indexes from gfx/1_surfaces.gfx, offset 32)
+planetyps={
+ -- stone_tile
+ {tex=32,scale=1,height=0.5,lit=true,xvel=0,yvel=0},
+ -- dirt
+ {tex=33,scale=1,height=0.5,lit=true,xvel=0,yvel=0},
+ -- stone_ceiling
+ {tex=34,scale=1,height=0.5,lit=false,xvel=0,yvel=0},
+ -- sky
+ {tex=35,scale=2,height=1,lit=false,xvel=0.01,yvel=0},
+ -- night_sky
+ {tex=36,scale=2,height=1,lit=false,xvel=0.005,yvel=0}
+}
+
+-- wall texture sets (sprite indexes from gfx/0_walls.gfx)
+texsets={
+ -- none (removed to avoid collision with brick variant 0)
+ -- brick
+ {base=0,variants={0,1,2,3}},
+ -- cobblestone
+ {base=4,variants={4,5,6,7}},
+ -- wood_plank
+ {base=8,variants={8,9,10,11}},
+ -- stone
+ {base=12,variants={12,13,14,15}},
+ -- grass (outdoor)
+ {base=16,variants={16,17,18,19}},
+ -- earth (outdoor)
+ {base=20,variants={20,21,22,23}}
+}
+
+-- door types (sprite indexes from gfx/0_walls.gfx)
+door_normal=24
+door_locked=25
+door_stay_open=26
+
+-- helper: check if tile is a door
+function is_door(val)
+ return val>=door_normal and val<=door_stay_open
+end
+
+-- exit types (tile IDs)
+exit_start=67
+exit_end=68
+
+-- wall fill constant
+wall_fill_tile=1
+
+-- generation parameters
+gen_params={
+	min_rooms=5,
+	max_rooms=15,
+	min_size=4,
+	max_size=12,
+	spacing=2,
+	room_door_prob=0.3,
+	erode_amount=50,
+	difficulty=1,
+	max_decorations_per_room=12,
+	npc_hostile_ratio=0.7,
+	items_per_room=2
+}
+
+gen_observability={
+ enable_console=false,
+ capture_history=true,
+ history_limit=400,
+ log_seed=true,
+ log_room_attempts=true,
+ log_corridors=true,
+ log_progression=true,
+ log_repairs=true
+}
+
+gen_adaptive_settings={
+ spacing_relax_threshold=4,
+ spacing_relax_step=1,
+ spacing_max_relax=4,
+ spacing_restore_delay=2,
+ spacing_restore_step=1,
+ max_room_failures=24,
+ offcenter_bias=0.65,
+ bias_radius=12,
+ junction_retry_limit=6,
+ corridor_jog_chance=0.25
+}
+
+-- helper constants
+max_spawn_attempts=50
+max_room_attempts=100
+
+-- door testing parameters
+test_door_open=nil -- if set to a value 0.0-1.0, forces all doors to this open state for testing
+test_door_x=nil -- if set, only affects door at this position
+test_door_y=nil -- if set, only affects door at this position
+
+-- object type definitions (mx=sprite index from gfx files, my deprecated, mw/mh use sprite_size)
+-- NOTE: my=0 is deprecated and maintained for backward compatibility only; will be removed once rendering code migrates
+obj_types={
+ player={solid=true,w=0.4,mx=0,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.8,flat=false,lit=nil,framect=nil,animspd=nil,yoffs=nil,kind="player"},
+ enemy={solid=true,w=0.4,mx=64,my=0,mw=sprite_size,mh=sprite_size,y=0.1,h=0.8,flat=false,lit=nil,framect=4,animspd=0.25,yoffs={0,-0.01,0,-0.01},kind="hostile_npc",ai_type="follow",follow_speed=0.05,follow_range=20,patrol_speed=0.03},
+ item={solid=false,w=0.3,mx=128,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=false,lit=nil,framect=nil,animspd=nil,yoffs=nil,kind="direct_pickup",subtype="generic"},
+ key={solid=false,w=0.3,mx=129,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=false,lit=nil,framect=nil,animspd=nil,yoffs=nil,kind="direct_pickup",subtype="key"},
+ heart={solid=false,w=0.3,mx=130,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=false,lit=nil,framect=2,animspd=0.1,yoffs={0,0.05},kind="direct_pickup",subtype="heart"},
+ decoration={solid=false,w=0.3,mx=148,my=0,mw=sprite_size,mh=sprite_size,y=0.3,h=0.4,flat=false,lit=0,framect=4,animspd=0.25,yoffs=nil,kind="decorative"},
+ hostile_npc={solid=true,w=0.4,mx=64,my=0,mw=sprite_size,mh=sprite_size,y=0.1,h=0.8,flat=false,lit=nil,framect=4,animspd=0.25,yoffs={0,-0.01,0,-0.01},kind="hostile_npc",ai_type="follow",follow_speed=0.05,follow_range=20,patrol_speed=0.03},
+ non_hostile_npc={solid=false,w=0.4,mx=73,my=0,mw=sprite_size,mh=sprite_size,y=0.1,h=0.8,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="non_hostile_npc"},
+ direct_pickup={solid=false,w=0.2,mx=128,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=false,lit=nil,framect=2,animspd=0.1,yoffs={0,0.05},kind="direct_pickup"},
+ interactable_chest={solid=false,w=0.3,mx=131,my=0,mw=sprite_size,mh=sprite_size,y=0.3,h=0.3,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="chest"},
+ interactable_shrine={solid=false,w=0.4,mx=132,my=0,mw=sprite_size,mh=sprite_size,y=0.3,h=0.5,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="shrine"},
+ interactable_trap={solid=false,w=0.2,mx=133,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.1,flat=true,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="trap"},
+ interactable_note={solid=false,w=0.3,mx=134,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=true,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="note"},
+ interactable_exit={solid=false,w=0.3,mx=135,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="exit"}
+}
+
+-- enemy type definitions (sprite indexes from gfx/2_characters.gfx, offset 64)
+enemy_types={
+ {name="rat",difficulty=1,min_count=1,max_count=3,obj_type=obj_types.hostile_npc,sprite=64,hp=1},
+ {name="bat",difficulty=2,min_count=1,max_count=4,obj_type=obj_types.hostile_npc,sprite=65,hp=1},
+ {name="slime",difficulty=3,min_count=2,max_count=5,obj_type=obj_types.hostile_npc,sprite=66,hp=2},
+ {name="skeleton",difficulty=4,min_count=1,max_count=3,obj_type=obj_types.hostile_npc,sprite=67,hp=3},
+ {name="goblin",difficulty=5,min_count=2,max_count=4,obj_type=obj_types.hostile_npc,sprite=68,hp=3},
+ {name="orc",difficulty=6,min_count=1,max_count=3,obj_type=obj_types.hostile_npc,sprite=69,hp=4},
+ {name="troll",difficulty=7,min_count=1,max_count=2,obj_type=obj_types.hostile_npc,sprite=70,hp=5},
+ {name="demon",difficulty=8,min_count=1,max_count=2,obj_type=obj_types.hostile_npc,sprite=71,hp=6},
+ {name="dragon",difficulty=9,min_count=1,max_count=1,obj_type=obj_types.hostile_npc,sprite=72,hp=10}
+}
+
+-- decoration type definitions (sprite indexes from gfx/3_props.gfx, offset 148)
+decoration_types={
+ {name="torch",difficulty=1,obj_type=obj_types.decoration,gen_tags={"lit","uni"},theme_tags={"dng","lit"},sprite=148},
+ {name="barrel",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni"},theme_tags={"dng","house"},sprite=149},
+ {name="crate",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni2"},theme_tags={"dng","house"},sprite=150},
+ {name="pillar",difficulty=2,obj_type=obj_types.decoration,gen_tags={"big"},theme_tags={"dng","dem"},sprite=151},
+ {name="statue",difficulty=3,obj_type=obj_types.decoration,gen_tags={"rare"},theme_tags={"dng","dem"},sprite=152},
+ {name="chest",difficulty=2,obj_type=obj_types.decoration,gen_tags={"scatter"},theme_tags={"dng","house"},sprite=153},
+ {name="tree",difficulty=1,obj_type=obj_types.decoration,gen_tags={"scatter"},theme_tags={"out"},sprite=154},
+ {name="rock",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni"},theme_tags={"out"},sprite=155}
+}
+
+-- theme definitions
+themes={
+ dng={
+  floor="stone_tile",
+  roof="stone_ceiling",
+  decor_prob=0.8,
+  rules={
+   room_shape_weights={square=0.5,hall_horizontal=0.25,hall_vertical=0.2,grand=0.1},
+   room_extra_size=1,
+   bias_radius=10,
+   center_bias=0.55,
+   corridor_jog_chance=0.2,
+   erosion_intensity=1.0
+  }
+ },
+ out={
+  floor="dirt",
+  roof="sky",
+  decor_prob=0.5,
+  rules={
+   room_shape_weights={hall_horizontal=0.45,square=0.35,grand=0.05,hall_vertical=0.15},
+   room_extra_size=0,
+   bias_radius=14,
+   center_bias=0.7,
+   corridor_jog_chance=0.35,
+   erosion_intensity=1.2
+  }
+ },
+ dem={
+  floor="stone_tile",
+  roof="night_sky",
+  decor_prob=0.9,
+  rules={
+   room_shape_weights={square=0.4,hall_vertical=0.3,hall_horizontal=0.2,grand=0.15},
+   room_extra_size=2,
+   bias_radius=8,
+   center_bias=0.5,
+   corridor_jog_chance=0.15,
+   erosion_intensity=0.8
+  }
+ },
+ house={
+  floor="stone_tile",
+  roof="stone_ceiling",
+  decor_prob=0.7,
+  rules={
+   room_shape_weights={square=0.6,hall_horizontal=0.2,hall_vertical=0.2},
+   room_extra_size=0,
+   bias_radius=9,
+   center_bias=0.6,
+   corridor_jog_chance=0.1,
+   erosion_intensity=0.5
+  }
+ },
+ dark={
+  floor="stone_tile",
+  roof="night_sky",
+  decor_prob=0.6,
+  rules={
+   room_shape_weights={square=0.35,hall_vertical=0.35,hall_horizontal=0.2,grand=0.1},
+   room_extra_size=1,
+   bias_radius=8,
+   center_bias=0.5,
+   corridor_jog_chance=0.25,
+   erosion_intensity=0.9
+  }
+ }
+}
+
+:: src/globals.lua
+--[[pod_format="raw",created="2024-09-08 09:49:37",modified="2025-03-07 13:16:47",revision=5]]
+--[[
+	globals.lua - global utility functions
+	(c) 2025 Andrew Vasilyev. All rights reserved.
+
+	This program is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	This program is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with this program. If not, see <https://www.gnu.org/licenses/>.
+]]
+
+local wm_pid = 3 -- Process ID of Picotron's window manager and info bar
+
+-- Reports a fatal error, logs the message and traceback, and exits the program.
+-- @param message: The format string for the error message
+-- @param exit_code: Optional custom exit code (default is 1)
+-- @param ...: Additional arguments to format the message
+function wtf(message, exit_code, ...)
+	local error_report = debug.traceback(string.format(message, ...), 2)
+
+	send_message(wm_pid, { event = "report_error", content = "*wtf?!" })
+	send_message(wm_pid, { event = "report_error", content = error_report })
+
+	exit(exit_code or 1)
+end
+
+-- Retrieves the process ID (PID) by process name.
+-- @param name: The name of the process to search for.
+-- @return: The process ID if found, or -1 if not found.
+function get_pid_by_name(name)
+	local processes = fetch("/ram/system/processes.pod")
+
+	for i = 1, #processes do
+		local process = processes[i]
+		if (process.name == name) then
+			-- Return the process ID if found
+			return process.id
+		end
+	end
+
+	return -1
+end
+
+:: src/logview.lua
+--[[pod_format="raw",created="2024-09-08 09:51:03",modified="2025-03-07 13:16:38",revision=5]]
+--[[
+	logview.lua - log viewer utility
+	(c) 2025 Andrew Vasilyev. All rights reserved.
+
+	This program is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	This program is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with this program. If not, see <https://www.gnu.org/licenses/>.
+]]
+
+local gui = create_gui()
+
+-- Initializes the log viewer window and sets up the log display.
+function _init()
+	window({
+		width      = 320,
+		height     = 200,
+		resizeable = true,
+		title      = "Log Viewer"
+	})
+
+	local lines = {}
+
+	-- Attach a log display panel to the GUI
+	gui:attach({
+		x = 1,
+		y = 1,
+		width = 480,
+		height = 0,
+		update = function(self, ev)
+			self.height = #lines * 9  -- Adjust the height dynamically based on the number of lines
+		end,
+		draw = function(self, ev)
+			for i = 1, #lines do
+				print(lines[i], 0, (i - 1) * 9)
+			end
+		end
+	})
+
+	-- Attach scrollbars to the GUI, with autohide enabled
+	gui:attach_scrollbars({
+		autohide = true
+	})
+
+	-- Event listener to handle incoming log entries
+	on_event("entry", function(entry)
+		table.insert(lines, entry.presentation)
+
+		-- Ensure the log display doesn't exceed 500 lines
+		while (#lines > 500) do
+			table.remove(lines, 1)
+		end
+	end)
+end
+
+-- Clears the screen and draws the GUI.
+-- This function is called every frame to refresh the display.
+function _draw()
+	cls(1)
+	gui:draw_all()
+end
+
+-- Updates the GUI state based on input or events.
+-- Called every frame to handle updates to the GUI.
+function _update()
+	gui:update_all()
+end
+
+:: src/procgen/dungeon/corridors.lua
+--[[pod_format="raw",created="2025-11-18 13:10:00",modified="2025-11-18 13:10:00",revision=1]]
+
+local spacing  = require("procgen.dungeon.spacing")
+local geometry = require("procgen.dungeon.geometry")
+
+local corridors = {}
+
+local observability      = spacing.observability
+local adaptive_settings  = spacing.adaptive_settings
+local gen_log            = spacing.gen_log
+local protect_tile       = spacing.protect_tile
+
+local function rect_conflicts(rect, ignore_nodes, spacing_override)
+	return geometry.rect_conflicts(rect, gen_rects, map_size, ignore_nodes, spacing_override, spacing.get_dynamic_spacing())
+end
+
+local function get_corridor_type_internal(r1, r2)
+	local ox = not (r1[3] < r2[1] or r1[1] > r2[3])
+	local oy = not (r1[4] < r2[2] or r1[2] > r2[4])
+	if ox and not oy then return "vert" end
+	if oy and not ox then return "horiz" end
+	return "l_shape"
+end
+
+local function place_boundary_door_with_retry_internal(bx, by, dtype, max_attempts)
+	dtype = dtype or door_normal
+	local offsets = {{0,0},{-1,0},{1,0},{0,-1},{0,1},{-2,0},{2,0},{0,-2},{0,2}}
+	local attempts = max_attempts or #offsets
+	for i = 1, attempts do
+		local off = offsets[i] or offsets[#offsets]
+		local ax, ay = bx + off[1], by + off[2]
+		if ax >= 0 and ax < map_size and ay >= 0 and ay < map_size then
+			local tile = get_wall(ax, ay)
+			if is_wall(tile) then
+				set_wall(ax, ay, dtype)
+				create_door(ax, ay, dtype)
+				protect_tile(ax, ay)
+				if observability.log_corridors then
+					gen_log("door", "boundary door placed at "..ax..","..ay.." (from "..bx..","..by..")")
+				end
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function place_boundary_door_internal(bx, by, dtype)
+	if bx >= 0 and bx < 128 and by >= 0 and by < 128 then
+		if is_wall(get_wall(bx, by)) then
+			set_wall(bx, by, dtype or door_normal)
+			create_door(bx, by, dtype)
+			protect_tile(bx, by)
+			return true
+		end
+	end
+	return false
+end
+
+local function ensure_boundary_passage_internal(bx, by, floor_id)
+	if not floor_id then return false end
+	if bx >= 0 and bx < 128 and by >= 0 and by < 128 then
+		local tile = get_wall(bx, by)
+		if tile > 0 and not is_door(tile) and not is_exit(tile) then
+			set_wall(bx, by, 0)
+			set_floor(bx, by, floor_id)
+			protect_tile(bx, by)
+			if observability.log_repairs then
+				gen_log("door", "fallback cleared wall at ("..bx..","..by..")")
+			end
+			return true
+		end
+	end
+	return false
+end
+
+local function verify_boundary_door_internal(bx, by, dtype, floor_id)
+	if not bx or not by then return end
+	dtype = dtype or door_normal
+	if bx < 0 or bx >= map_size or by < 0 or by >= map_size then return end
+	local tile = get_wall(bx, by)
+	if is_door(tile) then
+		protect_tile(bx, by)
+		return
+	end
+	if tile == 0 then
+		set_wall(bx, by, dtype)
+		create_door(bx, by, dtype)
+		protect_tile(bx, by)
+		if observability.log_repairs then
+			gen_log("door", "repaired missing door at "..bx..","..by)
+		end
+	else
+		local ok = place_boundary_door_with_retry_internal(bx, by, dtype, 6)
+		if not ok then
+			ensure_boundary_passage_internal(bx, by, floor_id)
+		end
+	end
+end
+
+local function carve_horizontal_span(y, x_start, x_end, floor_id)
+	if not floor_id then return end
+	if y < 0 or y >= map_size then return end
+	local a = min(x_start, x_end)
+	local b = max(x_start, x_end)
+	a = max(0, a)
+	b = min(map_size - 1, b)
+	for x = a, b do
+		set_wall(x, y, 0)
+		set_floor(x, y, floor_id)
+	end
+end
+
+local function carve_vertical_span(x, y_start, y_end, floor_id)
+	if not floor_id then return end
+	if x < 0 or x >= map_size then return end
+	local a = min(y_start, y_end)
+	local b = max(y_start, y_end)
+	a = max(0, a)
+	b = min(map_size - 1, b)
+	for y = a, b do
+		set_wall(x, y, 0)
+		set_floor(x, y, floor_id)
+	end
+end
+
+local function create_horizontal_corridor(n1, n2, edge, floor_id)
+	local left, right = n1, n2
+	if n1.midx > n2.midx then left, right = n2, n1 end
+	local r_left, r_right = left.rect, right.rect
+	local y_start = max(r_left[2], r_right[2])
+	local y_end   = min(r_left[4], r_right[4])
+	local y
+	if y_start <= y_end then
+		y = flr((y_start + y_end) / 2)
+	else
+		y = flr((n1.midy + n2.midy) / 2)
+	end
+	local jog_offset = 0
+	local jog_chance = (active_theme_rules and active_theme_rules.corridor_jog_chance) or adaptive_settings.corridor_jog_chance or 0.25
+	if rnd(1) < jog_chance then
+		local offset = (rnd(1) < 0.5) and -1 or 1
+		local candidate = y + offset
+		if candidate > 1 and candidate < map_size - 2 then
+			y = candidate
+			jog_offset = offset
+		end
+	end
+	local bx_left  = r_left[3] + 1
+	local bx_right = r_right[1] - 1
+	local success  = true
+	if not place_boundary_door_with_retry_internal(bx_left, y, door_normal, 5) then
+		success = false
+		ensure_boundary_passage_internal(bx_left, y, floor_id)
+	end
+	if not place_boundary_door_with_retry_internal(bx_right, y, door_normal, 5) then
+		success = false
+		ensure_boundary_passage_internal(bx_right, y, floor_id)
+	end
+	carve_horizontal_span(y, bx_left + 1, bx_right - 1, floor_id)
+	verify_boundary_door_internal(bx_left,  y, door_normal, floor_id)
+	verify_boundary_door_internal(bx_right, y, door_normal, floor_id)
+	edge.b1 = {x = bx_left,  y = y}
+	edge.b2 = {x = bx_right, y = y}
+	edge.shape = jog_offset ~= 0 and "jog" or "straight"
+	edge.metadata.corridor_y = y
+	edge.metadata.jog_offset = jog_offset
+	return success
+end
+
+local function create_vertical_corridor(n1, n2, edge, floor_id)
+	local top, bottom = n1, n2
+	if n1.midy > n2.midy then top, bottom = n2, n1 end
+	local r_top, r_bottom = top.rect, bottom.rect
+	local x_start = max(r_top[1], r_bottom[1])
+	local x_end   = min(r_top[3], r_bottom[3])
+	local x
+	if x_start <= x_end then
+		x = flr((x_start + x_end) / 2)
+	else
+		x = flr((n1.midx + n2.midx) / 2)
+	end
+	local jog_offset = 0
+	local jog_chance = (active_theme_rules and active_theme_rules.corridor_jog_chance) or adaptive_settings.corridor_jog_chance or 0.25
+	if rnd(1) < jog_chance then
+		local offset = (rnd(1) < 0.5) and -1 or 1
+		local candidate = x + offset
+		if candidate > 1 and candidate < map_size - 2 then
+			x = candidate
+			jog_offset = offset
+		end
+	end
+	local by_top    = r_top[4]    + 1
+	local by_bottom = r_bottom[2] - 1
+	local success   = true
+	if not place_boundary_door_with_retry_internal(x, by_top, door_normal, 5) then
+		success = false
+		ensure_boundary_passage_internal(x, by_top, floor_id)
+	end
+	if not place_boundary_door_with_retry_internal(x, by_bottom, door_normal, 5) then
+		success = false
+		ensure_boundary_passage_internal(x, by_bottom, floor_id)
+	end
+	carve_vertical_span(x, by_top + 1, by_bottom - 1, floor_id)
+	verify_boundary_door_internal(x, by_top,    door_normal, floor_id)
+	verify_boundary_door_internal(x, by_bottom, door_normal, floor_id)
+	edge.b1 = {x = x, y = by_top}
+	edge.b2 = {x = x, y = by_bottom}
+	edge.shape = jog_offset ~= 0 and "jog" or "straight"
+	edge.metadata.corridor_x = x
+	edge.metadata.jog_offset = jog_offset
+	return success
+end
+
+local function create_l_shaped_corridor(n1, n2, edge, floor_id)
+	local orient_horizontal_first = rnd(1) < 0.5
+	local anchor_x = orient_horizontal_first and n2.midx or n1.midx
+	local anchor_y = orient_horizontal_first and n1.midy or n2.midy
+	local jrect
+	local offsets = {{0,0},{1,0},{-1,0},{0,1},{0,-1},{2,0},{-2,0},{0,2},{0,-2}}
+	local attempt_limit = adaptive_settings.junction_retry_limit or 4
+	for i = 1, #offsets do
+		local off = offsets[i]
+		local cx = max(1, min(map_size - 2, anchor_x + off[1]))
+		local cy = max(1, min(map_size - 2, anchor_y + off[2]))
+		local candidate = {cx - 1, cy - 1, cx + 1, cy + 1}
+		if not rect_conflicts(candidate, {n1, n2}, 0) then
+			jrect = candidate
+			anchor_x = cx
+			anchor_y = cy
+			break
+		end
+		if i >= attempt_limit then break end
+	end
+	local success = true
+	if not jrect then
+		orient_horizontal_first = true
+		anchor_x = n2.midx
+		anchor_y = n1.midy
+		jrect = nil
+		success = false
+		if observability.log_corridors then
+			gen_log("corridor", "fallback L-shape without junction between rooms")
+		end
+	else
+		fill_rect(jrect, 0)
+		for x = jrect[1], jrect[3] do
+			for y = jrect[2], jrect[4] do
+				set_floor(x, y, floor_id)
+			end
+		end
+		local jnode = add_room(jrect, true)
+		edge.metadata.junction_node = jnode
+	end
+
+	local function connect_horizontal(from_node, target_x, y)
+		local rect = from_node.rect
+		local side = target_x > from_node.midx and 1 or -1
+		local boundary_from = (side == 1) and rect[3] + 1 or rect[1] - 1
+		local boundary_to = side == 1 and target_x - 1 or target_x + 1
+		local door_pos = boundary_from
+		if not place_boundary_door_with_retry_internal(door_pos, y, door_normal, 5) then
+			success = false
+			ensure_boundary_passage_internal(door_pos, y, floor_id)
+		end
+		carve_horizontal_span(y, boundary_from + side, boundary_to, floor_id)
+		verify_boundary_door_internal(door_pos, y, door_normal, floor_id)
+		return {x = door_pos, y = y}
+	end
+
+	local function connect_vertical(from_node, x, target_y)
+		local rect = from_node.rect
+		local side = target_y > from_node.midy and 1 or -1
+		local boundary_from = (side == 1) and rect[4] + 1 or rect[2] - 1
+		local boundary_to = side == 1 and target_y - 1 or target_y + 1
+		local door_pos = boundary_from
+		if not place_boundary_door_with_retry_internal(x, door_pos, door_normal, 5) then
+			success = false
+			ensure_boundary_passage_internal(x, door_pos, floor_id)
+		end
+		carve_vertical_span(x, boundary_from + side, boundary_to, floor_id)
+		verify_boundary_door_internal(x, door_pos, door_normal, floor_id)
+		return {x = x, y = door_pos}
+	end
+
+	local b1, b2
+	if orient_horizontal_first then
+		local horizontal_y = n1.midy
+		b1 = connect_horizontal(n1, anchor_x, horizontal_y)
+		local vertical_x = jrect and anchor_x or b1.x + (anchor_x > b1.x and 1 or -1)
+		b2 = connect_vertical(n2, vertical_x, anchor_y)
+	else
+		local vertical_x = n1.midx
+		b1 = connect_vertical(n1, vertical_x, anchor_y)
+		local horizontal_y = jrect and anchor_y or b1.y + (anchor_y > b1.y and 1 or -1)
+		b2 = connect_horizontal(n2, anchor_x, horizontal_y)
+	end
+
+	edge.b1 = b1
+	edge.b2 = b2
+	edge.shape = "l_shape"
+	edge.metadata.anchor = {x = anchor_x, y = anchor_y}
+	edge.metadata.orientation = orient_horizontal_first and "hv" or "vh"
+	return success
+end
+
+function corridors.get_corridor_type(r1, r2)
+	return get_corridor_type_internal(r1, r2)
+end
+
+function corridors.place_boundary_door_with_retry(bx, by, dtype, max_attempts)
+	return place_boundary_door_with_retry_internal(bx, by, dtype, max_attempts)
+end
+
+function corridors.place_boundary_door(bx, by, dtype)
+	return place_boundary_door_internal(bx, by, dtype)
+end
+
+function corridors.ensure_boundary_passage(bx, by, floor_id)
+	return ensure_boundary_passage_internal(bx, by, floor_id)
+end
+
+function corridors.create_corridor(n1, n2, floor_id)
+	local edge = { n1 = n1, n2 = n2, metadata = {} }
+	local ctype = get_corridor_type_internal(n1.rect, n2.rect)
+	local success
+	if ctype == "horiz" then
+		success = create_horizontal_corridor(n1, n2, edge, floor_id)
+	elseif ctype == "vert" then
+		success = create_vertical_corridor(n1, n2, edge, floor_id)
+	else
+		success = create_l_shaped_corridor(n1, n2, edge, floor_id)
+	end
+	edge.success = success
+	add(gen_edges, edge)
+	add(n1.edges, n2)
+	add(n2.edges, n1)
+	if observability.log_corridors then
+		local status = success and "ok" or "fallback"
+		gen_log("corridor", "linked nodes "..n1.index.." <-> "..n2.index.." ("..ctype..","..status..")")
+	end
+	return success
+end
+
+return corridors
+
+:: src/procgen/dungeon/doors.lua
+--[[pod_format="raw",created="2025-11-18 15:30:00",modified="2025-11-18 15:30:00",revision=1]]
+-- door animation system (dungeon-local)
+
+-- test mode state (to avoid permanent mutation)
+ test_mode_prev=false
+ test_mode_saved_state={}
+
+ -- create a door
+ function create_door(x,y,dtype,key_id)
+  local door={
+   x=x,
+   y=y,
+   open=0, -- 0=closed, 1=fully open
+   opening=false, -- animation state
+   timer=0,
+   dtype=dtype or door_normal,
+   keynum=key_id, -- nil if unlocked, key id if locked
+   stayopen=(dtype==door_stay_open) -- doors with door_stay_open dtype stay open
+  }
+  
+  -- prevent duplicates at same grid cell
+  local existing = doorgrid[x] and doorgrid[x][y] or nil
+  if existing then
+   printh("warning: duplicate door at ("..x..","..y..") - replacing")
+   del(doors, existing)
+  end
+  add(doors,door)
+  doorgrid[x][y]=door
+ 	 -- walls layer already set by generation to door tile ID (authoritative)
+  
+  return door
+ end
+ 
+ -- update all doors
+ function update_doors()
+  -- handle test mode transitions to avoid permanent state mutation
+  if test_door_mode and not test_mode_prev then
+   -- entering test mode: save states
+   test_mode_saved_state={}
+   for door in all(doors) do
+    test_mode_saved_state[door]={open=door.open,opening=door.opening,timer=door.timer}
+   end
+  elseif (not test_door_mode) and test_mode_prev then
+   -- exiting test mode: restore states
+   for door in all(doors) do
+    local st=test_mode_saved_state[door]
+    if st~=nil then
+     door.open=st.open
+     door.opening=st.opening
+     door.timer=st.timer
+    end
+   end
+   test_mode_saved_state={}
+  end
+  
+  -- in test mode, temporarily override open values (restored on exit)
+  if test_door_mode then
+   for door in all(doors) do
+    door.open=test_door_open or 0
+   end
+   -- keep early return to skip normal animation while testing
+   test_mode_prev=true
+   return
+  end
+  
+  test_mode_prev=false
+  
+  for door in all(doors) do
+   if door.opening then
+    -- play sound on start
+    if door.open==0 then
+     -- sfx(10) -- door open sound
+    end
+    -- animate opening
+    door.open+=door_anim_speed
+    if door.open>1 then
+     door.open=1
+     door.opening=false
+     door.timer=door_close_delay
+    end
+   else
+    -- not opening
+    if door.timer>0 then
+     door.timer-=1
+    elseif not door.stayopen then
+     -- close door
+     door.open=max(door.open-door_anim_speed,0)
+    end
+   end
+  end
+ end
+ 
+ -- remove a door
+ function remove_door(x,y)
+  local door=doorgrid[x][y]
+  if door then
+   del(doors,door)
+   doorgrid[x][y]=nil
+ 		set_wall(x,y,0)
+  end
+ end
+
+:: src/procgen/dungeon/geometry.lua
+--[[pod_format="raw",created="2025-11-18 12:32:00",modified="2025-11-18 12:32:00",revision=1]]
+local geometry = {}
+
+function geometry.rect_overlaps(rect, gen_rects, dynamic_spacing, map_size)
+	if rect[1] < 0 or rect[3] >= map_size or rect[2] < 0 or rect[4] >= map_size then
+		return true
+	end
+	local spacing = dynamic_spacing or 0
+	for _, r in ipairs(gen_rects) do
+		if r then
+			if not (rect[3] + spacing < r[1]
+				or rect[1] > r[3] + spacing
+				or rect[4] + spacing < r[2]
+				or rect[2] > r[4] + spacing) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+function geometry.rect_conflicts(rect, gen_rects, map_size, ignore_nodes, spacing_override, dynamic_spacing)
+	if rect[1] < 0 or rect[3] >= map_size or rect[2] < 0 or rect[4] >= map_size then
+		return true
+	end
+	local ignore = {}
+	if ignore_nodes then
+		for _, n in ipairs(ignore_nodes) do
+			if n and n.index then
+				ignore[n.index] = true
+			end
+		end
+	end
+	local spacing = (spacing_override ~= nil) and spacing_override or (dynamic_spacing or 0)
+	for idx = 1, #gen_rects do
+		if not ignore[idx] then
+			local r = gen_rects[idx]
+			if r and not (rect[3] + spacing < r[1]
+				or rect[1] > r[3] + spacing
+				or rect[4] + spacing < r[2]
+				or rect[2] > r[4] + spacing) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+function geometry.fill_rect(rect, val, set_wall, map_size)
+	local max_index = map_size - 1
+	local x0 = max(0, rect[1])
+	local x1 = min(max_index, rect[3])
+	local y0 = max(0, rect[2])
+	local y1 = min(max_index, rect[4])
+	local fill_val = val or 0
+	for x = x0, x1 do
+		for y = y0, y1 do
+			set_wall(x, y, fill_val)
+		end
+	end
+end
+
+return geometry
+
+:: src/procgen/dungeon/pipeline.lua
+--[[pod_format="raw",created="2025-11-07 21:17:13",modified="2025-11-07 21:48:06",revision=1]]
+-- procedural dungeon generation
+
+-- generation state
+gen_rects={}
+gen_nodes={}
+gen_edges={}
+gen_inventory={}
+gen_objects={}
+gen_locked_edges={}
+
+local themes_mod  = require("procgen.dungeon.themes")
+local geometry    = require("procgen.dungeon.geometry")
+local spacing     = require("procgen.dungeon.spacing")
+local rooms       = require("procgen.dungeon.rooms")
+local corridors   = require("procgen.dungeon.corridors")
+local progression = require("procgen.dungeon.progression")
+local population  = require("procgen.dungeon.population")
+
+local observability = spacing.observability
+local adaptive_settings = spacing.adaptive_settings
+
+local gen_log = spacing.gen_log
+local register_room_failure = spacing.register_room_failure
+local register_room_success = spacing.register_room_success
+local clear_protected = spacing.clear_protected
+local protect_tile = spacing.protect_tile
+local is_tile_protected = spacing.is_tile_protected
+
+-- theme-specific floor id used during carving/eroding; initialized to stone_tile (1)
+local gen_floor_id=1
+
+local function rect_area(rect)
+ return (rect[3]-rect[1]+1)*(rect[4]-rect[2]+1)
+end
+
+local function classify_room_style(rect)
+ local w=rect[3]-rect[1]+1
+ local h=rect[4]-rect[2]+1
+ local ratio=w/h
+ if ratio>=1.8 then
+  return "hall_horizontal"
+ elseif ratio<=0.55 then
+  return "hall_vertical"
+ elseif w*h>=120 then
+  return "grand"
+ elseif w<=6 and h<=6 then
+  return "compact"
+ else
+  return "square"
+ end
+end
+
+local function choose_weighted(weights,default_key)
+ if not weights then return default_key end
+ local total=0
+ for _,v in pairs(weights) do
+  total+=v
+ end
+ if total<=0 then return default_key end
+ local roll=rnd(total)
+ local acc=0
+ for key,v in pairs(weights) do
+  acc+=v
+  if roll<=acc then return key end
+ end
+ return default_key
+end
+
+local function get_edge_between(a,b)
+	return progression.get_edge_between(a,b)
+end
+
+local function locate_room_for_position(x,y)
+	return progression.locate_room_for_position(x,y)
+end
+
+local function relocate_key_to_room(keynum,target_node)
+	return progression.relocate_key_to_room(keynum,target_node)
+end
+
+local function validate_and_repair_progression(start_node,locked_edges)
+	return progression.validate_and_repair_progression(start_node,locked_edges)
+end
+
+local function ensure_theme_rules(theme)
+ active_theme_rules = themes_mod.ensure_theme_rules(theme, themes, adaptive_settings)
+end
+
+-- helper: check if tile is a wall
+function is_wall(val)
+ return val>0 and val<door_normal
+end
+
+-- helper: check if tile is a door
+function is_door(val)
+ return val>=door_normal and val<=door_stay_open
+end
+
+-- helper: check if tile is an exit
+function is_exit(val)
+ return val>=exit_start and val<=exit_end
+end
+
+-- helper: boundary cell is reserved if it has a door/exit in either layer
+function is_reserved_boundary(x,y)
+ local w=get_wall(x,y)
+ if is_door(w) or is_exit(w) then return true end
+ -- defensive: should always be 0 if walls layer is authoritative
+ if get_door(x,y)>0 then return true end
+ if doorgrid[x] and doorgrid[x][y] then return true end
+ return false
+end
+
+-- helper: check if rectangles overlap
+function rect_overlaps(rect)
+	return geometry.rect_overlaps(rect, gen_rects, spacing.get_dynamic_spacing(), map_size)
+end
+
+local function rect_conflicts(rect,ignore_nodes,spacing_override)
+	return geometry.rect_conflicts(rect, gen_rects, map_size, ignore_nodes, spacing_override, spacing.get_dynamic_spacing())
+end
+
+-- helper: fill rectangle using set_wall
+-- Note: Uses Lua loops with userdata:set() calls; potential optimization:
+-- batch userdata operations or memset() if available per Picotron guidelines
+function fill_rect(rect,val)
+ geometry.fill_rect(rect, val, set_wall, map_size)
+end
+
+-- helper: try place door with fallback positions
+function try_place_door_with_fallback(x,y,dtype)
+ dtype=dtype or door_normal
+ local attempts={{0,0},{-1,0},{1,0},{0,-1},{0,1},{-2,0},{2,0},{0,-2},{0,2}}
+ local should_place=rnd(1)<gen_params.room_door_prob
+ if not should_place then
+  gen_log("door","skipped optional door at "..x..","..y)
+  return false
+ end
+ for i=1,#attempts do
+  local off=attempts[i]
+  local ax,ay=x+off[1],y+off[2]
+  if ax>=0 and ax<map_size and ay>=0 and ay<map_size then
+   local existing=get_wall(ax,ay)
+   if is_wall(existing) then
+    set_wall(ax,ay,dtype)
+    create_door(ax,ay,dtype)
+    protect_tile(ax,ay)
+    if observability.log_corridors then
+     gen_log("door","placed door at "..ax..","..ay.." after "..i.." attempts")
+    end
+    return true
+   end
+  end
+ end
+ if observability.log_repairs then
+  gen_log("door","failed to place door near "..x..","..y)
+ end
+ return false
+end
+
+-- helper: generate random room
+function random_room(base_node,is_special)
+	return rooms.random_room(base_node, is_special)
+end
+
+-- helper: add room to generation state
+function add_room(rect,is_junction)
+	return rooms.add_room(rect, is_junction)
+end
+
+-- helper: determine corridor type between two rooms
+function get_corridor_type(r1,r2)
+ return corridors.get_corridor_type(r1, r2)
+end
+
+-- helper: place door at exact boundary wall tile with retry
+function place_boundary_door_with_retry(bx,by,dtype,max_attempts)
+ return corridors.place_boundary_door_with_retry(bx, by, dtype, max_attempts)
+end
+
+-- helper: place door at exact boundary wall tile
+function place_boundary_door(bx,by,dtype)
+ -- bx,by = boundary wall tile (between corridor and room)
+ return corridors.place_boundary_door(bx, by, dtype)
+end
+
+-- helper: ensure boundary passage (fallback for failed door placement)
+function ensure_boundary_passage(bx,by)
+ -- delegate to corridor module; uses current theme floor id
+ return corridors.ensure_boundary_passage(bx, by, gen_floor_id)
+end
+
+function create_corridor(n1,n2)
+ -- delegate full corridor creation logic to corridor module
+ return corridors.create_corridor(n1, n2, gen_floor_id)
+end
+
+-- helper: try to generate and connect a room
+function try_generate_room()
+ if #gen_nodes==0 then return false end
+ local base=gen_nodes[flr(rnd(#gen_nodes))+1]
+ if not base then return false end
+ local rect=random_room(base,false)
+ 
+ if rect[1]<2 or rect[3]>map_size-3 or rect[2]<2 or rect[4]>map_size-3 then
+  register_room_failure("bounds")
+  return false
+ end
+ 
+ if rect_overlaps(rect) then
+  register_room_failure("overlap")
+  return false
+ end
+ 
+ local node=add_room(rect)
+ fill_rect(rect,0)
+ for x=max(0,rect[1]),min(map_size-1,rect[3]) do
+  for y=max(0,rect[2]),min(map_size-1,rect[4]) do
+   set_floor(x, y, gen_floor_id)
+  end
+ end
+ local corridor_ok=create_corridor(base,node)
+ if not corridor_ok and observability.log_corridors then
+  gen_log("corridor","degenerate corridor between nodes "..base.index.." and "..node.index)
+ end
+ register_room_success()
+ return true
+end
+
+-- helper: apply wall textures to room perimeter
+function apply_room_walls(rect,tex)
+ -- ensure tex is never 0
+ if tex==0 then tex=1 end
+ 
+ for x=rect[1],rect[3] do
+  if rect[2]-1>=0 and rect[2]-1<128 and x>=0 and x<128 then
+   -- skip reserved cells (doors/exits in any layer)
+		if not is_reserved_boundary(x,rect[2]-1) then
+     set_wall(x,rect[2]-1,tex)
+   end
+  end
+  if rect[4]+1>=0 and rect[4]+1<128 and x>=0 and x<128 then
+   -- skip reserved cells (doors/exits in any layer)
+		if not is_reserved_boundary(x,rect[4]+1) then
+     set_wall(x,rect[4]+1,tex)
+   end
+  end
+ end
+ for y=rect[2],rect[4] do
+  if rect[1]-1>=0 and rect[1]-1<128 and y>=0 and y<128 then
+   -- skip reserved cells (doors/exits in any layer)
+		if not is_reserved_boundary(rect[1]-1,y) then
+     set_wall(rect[1]-1,y,tex)
+   end
+  end
+  if rect[3]+1>=0 and rect[3]+1<128 and y>=0 and y<128 then
+   -- skip reserved cells (doors/exits in any layer)
+		if not is_reserved_boundary(rect[3]+1,y) then
+     set_wall(rect[3]+1,y,tex)
+   end
+  end
+ end
+end
+
+-- repair step: ensure door tiles exist on walls layer for all logical doors
+function enforce_door_tiles()
+ for door in all(doors) do
+  if not is_door(get_wall(door.x,door.y)) then
+   set_wall(door.x,door.y,door.dtype or door_normal)
+  end
+ end
+ 
+ -- also check doorgrid consistency
+ for x=0,map_size-1 do
+  if doorgrid[x] then
+   for y=0,map_size-1 do
+    if doorgrid[x][y] then
+     local tile=get_wall(x,y)
+     if not is_door(tile) then
+      -- restore door tile from doorgrid or use default
+      local correct_tile=doorgrid[x][y].tile or door_normal
+      set_wall(x,y,correct_tile)
+      if observability.log_repairs then
+       gen_log("door","restored door tile at ("..x..","..y..")")
+      end
+     end
+    end
+   end
+  end
+ end
+end
+
+-- border ring enforcement: set outermost ring to walls while preserving doors/exits
+function enforce_border_ring()
+ -- top and bottom edges (y=0 and y=map_size-1)
+ for x=0,map_size-1 do
+  -- top edge
+  local top_tile=get_wall(x,0)
+  if not is_door(top_tile) and not is_exit(top_tile) then
+  set_wall(x,0,wall_fill_tile)
+  end
+  
+  -- bottom edge
+  local bottom_tile=get_wall(x,map_size-1)
+  if not is_door(bottom_tile) and not is_exit(bottom_tile) then
+  set_wall(x,map_size-1,wall_fill_tile)
+  end
+ end
+ 
+ -- left and right edges (x=0 and x=map_size-1)
+ for y=0,map_size-1 do
+  -- left edge
+  local left_tile=get_wall(0,y)
+  if not is_door(left_tile) and not is_exit(left_tile) then
+  set_wall(0,y,wall_fill_tile)
+  end
+  
+  -- right edge
+  local right_tile=get_wall(map_size-1,y)
+  if not is_door(right_tile) and not is_exit(right_tile) then
+  set_wall(map_size-1,y,wall_fill_tile)
+  end
+ end
+end
+
+-- helper: random wall texture (never returns 0)
+function random_wall_texture()
+ return themes_mod.random_wall_texture(texsets)
+end
+
+-- helper: get theme-appropriate wall texture set
+function theme_wall_texture(theme)
+ return themes_mod.theme_wall_texture(theme, texsets)
+end
+
+-- helper: find accessible rooms from start via edges
+function find_accessible_rooms(start_node,locked_edges)
+ local accessible={}
+ local queue={start_node}
+ local visited={}
+ visited[start_node]=true
+ 
+ while #queue>0 do
+  local node=queue[1]
+  deli(queue,1)
+  add(accessible,node)
+  
+  for edge_node in all(node.edges) do
+   if not visited[edge_node] then
+    local is_locked=false
+    if locked_edges then
+     for le in all(locked_edges) do
+					if (le.n1==node and le.n2==edge_node) or (le.n1==edge_node and le.n2==node) then
+       is_locked=true
+       break
+      end
+     end
+    end
+    
+    if not is_locked then
+     visited[edge_node]=true
+     add(queue,edge_node)
+    end
+   end
+  end
+ end
+ 
+ return accessible
+end
+
+-- helper: find spawn point in room
+function find_spawn_point(rect)
+ for attempt=1,max_spawn_attempts do
+  local x=rect[1]+1+flr(rnd(rect[3]-rect[1]-1))
+  local y=rect[2]+1+flr(rnd(rect[4]-rect[2]-1))
+  
+  if x>=0 and x<128 and y>=0 and y<128 and get_wall(x,y)==0 then
+   local valid=true
+   for obj in all(gen_objects) do
+    local ox=obj.pos and obj.pos[1] or obj.x
+    local oy=obj.pos and obj.pos[2] or obj.y
+    if ox and oy then
+     local dx,dy=abs(ox-x),abs(oy-y)
+     if dx<1 and dy<1 then
+      valid=false
+      break
+     end
+    end
+   end
+   
+   if valid then
+    return x+0.5,y+0.5
+   end
+  end
+ end
+ return nil,nil
+end
+
+-- helper: erode map for organic feel (generalized for all wall types)
+function erode_map(amount)
+ local intensity=(active_theme_rules and active_theme_rules.erosion_intensity) or 1
+ local target=flr(amount*intensity)
+ local removed=0
+ for i=1,target do
+  local x,y=flr(rnd(map_size)),flr(rnd(map_size))
+  if is_tile_protected(x,y) then goto continue end
+  if is_wall(get_wall(x,y)) then
+   local neighbors=0
+   local near_protected=false
+   for dx=-1,1 do
+    for dy=-1,1 do
+     local nx,ny=x+dx,y+dy
+     if nx>=0 and nx<map_size and ny>=0 and ny<map_size then
+      if is_tile_protected(nx,ny) then
+       near_protected=true
+      end
+      if get_wall(nx,ny)==0 then
+       neighbors+=1
+      end
+     end
+    end
+   end
+   if not near_protected and neighbors>=3 then
+    set_wall(x,y,0)
+    set_floor(x,y,gen_floor_id)
+    removed+=1
+   end
+  end
+ ::continue::
+ end
+ if observability.log_corridors and removed>target*0.7 then
+  gen_log("erosion","high erosion count "..removed.."/"..target)
+ end
+end
+
+-- helper: generate exit portal on wall
+function generate_exit(rect,exit_type)
+	return population.generate_exit(rect, exit_type)
+end
+
+-- gameplay generation: enemies, items, decorations, npcs
+function generate_gameplay()
+	return population.generate_gameplay()
+end
+
+-- generate progression: items and locked doors
+function generate_progression_loop(start_node)
+	-- delegate full progression logic (locking, keys, item placement, repair)
+	-- to the progression module to keep this pipeline focused on orchestration.
+	progression.generate_progression_loop(start_node)
+end
+
+-- generate npcs (hostile and non-hostile) in rooms
+function generate_npcs()
+	return population.generate_npcs()
+end
+
+-- generate items (pickups and interactables) in rooms
+function generate_items()
+	return population.generate_items()
+end
+
+-- generate decorations in rooms
+function generate_decorations()
+	return population.generate_decorations()
+end
+
+-- generate a complete dungeon
+function generate_dungeon(opts)
+ opts=opts or {}
+ local seed=opts.seed or flr(rnd(1000000))
+ srand(seed)
+ spacing.clear_history()
+ clear_protected()
+ spacing.reset_adaptive_spacing()
+ if gen_params.spacing==nil then gen_params.spacing=0 end
+ if observability.log_seed then
+  gen_log("seed","generation seed "..seed)
+ end
+ 
+ -- initialize state
+ gen_rects={}
+ gen_nodes={}
+ gen_edges={}
+ gen_inventory={}
+ gen_objects={}
+ doors={}
+ animated_objects={}
+ -- clear doorgrid
+ for x=0,map_size-1 do
+  if doorgrid[x] then
+   for y=0,map_size-1 do
+    doorgrid[x][y]=nil
+   end
+  end
+ end
+ 
+ -- fill with walls (non-zero tile)
+ fill_rect({0,0,map_size-1,map_size-1},wall_fill_tile)
+ 
+ -- assign global theme before carving (ensures theme floor id is available)
+ local selected_theme=opts.theme or "dng"
+ if not opts.theme then
+  local theme_roll=rnd(1)
+  if theme_roll<0.7 then
+   selected_theme="dng"
+  elseif theme_roll<0.9 then
+   selected_theme="out"
+  else
+   selected_theme="dem"
+  end
+ end
+ gen_params.theme=selected_theme
+ ensure_theme_rules(selected_theme)
+ local theme_config=themes[selected_theme] or themes.dng
+ 
+ -- set floor and ceiling types based on theme
+ local floor_idx=1
+ local roof_idx=3
+ if theme_config.floor=="stone_tile" then floor_idx=1
+ elseif theme_config.floor=="dirt" then floor_idx=2
+ end
+ if theme_config.roof=="stone_ceiling" then roof_idx=3
+ elseif theme_config.roof=="sky" then roof_idx=4
+ elseif theme_config.roof=="night_sky" then roof_idx=5
+ end
+ floor.typ=planetyps[floor_idx]
+ roof.typ=planetyps[roof_idx]
+ floor.x,floor.y=0,0
+ roof.x,roof.y=0,0
+ -- theme-specific floor id used by generator when carving/eroding
+ gen_floor_id=floor_idx
+ 
+ -- generate first room
+ local first_rect=random_room(nil,false)
+ local first_node=add_room(first_rect)
+ fill_rect(first_rect,0)
+ for x=max(0,first_rect[1]),min(map_size-1,first_rect[3]) do
+  for y=max(0,first_rect[2]),min(map_size-1,first_rect[4]) do
+   set_floor(x, y, gen_floor_id)
+  end
+ end
+ register_room_success()
+ 
+ -- generate additional rooms
+ local target_rooms=flr(rnd(gen_params.max_rooms-gen_params.min_rooms+1))+gen_params.min_rooms
+ for i=2,target_rooms do
+  local placed=false
+  for attempt=1,max_room_attempts do
+   if try_generate_room() then
+    placed=true
+    break
+   end
+  end
+  if not placed and observability.log_room_attempts then
+   gen_log("room","failed to place room "..i.." after "..max_room_attempts.." attempts")
+  end
+ end
+ 
+ -- apply wall textures based on theme
+ for node in all(gen_nodes) do
+  if not node.is_junction then
+   local texset=theme_wall_texture(selected_theme)
+   local tex=texset.variants[flr(rnd(#texset.variants))+1]
+   apply_room_walls(node.rect,tex)
+  end
+ end
+ 
+ -- ensure any doors placed earlier remain doors on the walls layer
+ enforce_door_tiles()
+ 
+ -- generate gameplay content (now aware of theme)
+ generate_gameplay()
+ -- gameplay may lock doors; re-assert tiles
+ enforce_door_tiles()
+ 
+ -- enforce border ring while preserving doors/exits
+ enforce_border_ring()
+ -- re-assert door tiles after border enforcement
+ enforce_door_tiles()
+ if observability.enable_console then
+  gen_log("summary","border ring enforced")
+ end
+ 
+ -- export objects to global arrays (flat iteration, no spatial grid)
+ objects=gen_objects
+ 
+ -- populate animated_objects list for frame updates
+ animated_objects={}
+ for ob in all(objects) do
+  if ob.autoanim then
+   add(animated_objects, ob)
+  end
+ end
+ 
+ -- set player start
+ player.x=first_node.midx+0.5
+ player.y=first_node.midy+0.5
+ 
+ if observability.enable_console then
+  gen_log("summary","rooms="..#gen_nodes.." objects="..#gen_objects)
+ end
+ 
+ return {x=player.x,y=player.y},{rooms=#gen_nodes,objects=#gen_objects,seed=seed,history=spacing.get_history()}
+end
+
+:: src/procgen/dungeon/population.lua
+--[[pod_format="raw",created="2025-11-18 14:10:00",modified="2025-11-18 14:10:00",revision=1]]
+
+local spacing = require("procgen.dungeon.spacing")
+
+local population = {}
+
+local observability = spacing.observability
+local gen_log       = spacing.gen_log
+
+function population.generate_exit(rect,exit_type)
+ local walls={}
+ for x=rect[1],rect[3] do
+		if rect[2]-1>=0 and is_wall(get_wall(x,rect[2]-1)) then
+   add(walls,{x,rect[2]})
+  end
+		if rect[4]+1<128 and is_wall(get_wall(x,rect[4]+1)) then
+   add(walls,{x,rect[4]})
+  end
+ end
+ for y=rect[2],rect[4] do
+		if rect[1]-1>=0 and is_wall(get_wall(rect[1]-1,y)) then
+   add(walls,{rect[1],y})
+  end
+		if rect[3]+1<128 and is_wall(get_wall(rect[3]+1,y)) then
+   add(walls,{rect[3],y})
+  end
+ end
+ 
+ if #walls>0 then
+  local pos=walls[flr(rnd(#walls))+1]
+  local exit_tile=exit_type==3 and exit_start or exit_end
+  set_wall(pos[1],pos[2],exit_tile or 0)
+  local ob={
+   pos={pos[1]+0.5,pos[2]+0.5},
+   typ=obj_types.interactable_exit,
+   rel={0,0},
+   frame=0,
+   animloop=true,
+   autoanim=false,
+   exit_type=exit_type
+  }
+  add(gen_objects,ob)
+ end
+end
+
+function population.generate_gameplay()
+ if not gen_nodes or #gen_nodes==0 then
+  gen_log("error","generate_gameplay() called with no rooms")
+  printh("error: generate_gameplay() called with no rooms")
+  return
+ end
+ local start_node=gen_nodes[1]
+ local exit_node=gen_nodes[#gen_nodes]
+ 
+ population.generate_exit(start_node.rect,3)
+ population.generate_exit(exit_node.rect,4)
+ 
+ erode_map(gen_params.erode_amount)
+ 
+ for i=1,3 do
+  add(gen_inventory,{type="heart"})
+ end
+ 
+ generate_progression_loop(start_node)
+ 
+ population.generate_npcs()
+ population.generate_items()
+ population.generate_decorations()
+end
+
+function population.generate_npcs()
+ for node in all(gen_nodes) do
+  local rect=node.rect
+  local num_npcs=flr(rnd(3))+1
+  
+  for i=1,num_npcs do
+   local x,y=find_spawn_point(rect)
+   if x then
+    if rnd(1)<gen_params.npc_hostile_ratio then
+     local available_enemies = {}
+     for enemy in all(enemy_types) do
+      if enemy.difficulty <= gen_params.difficulty then
+       add(available_enemies, enemy)
+      end
+     end
+     if #available_enemies == 0 then
+      available_enemies = {enemy_types[1]}
+     end
+     local enemy_type = available_enemies[flr(rnd(#available_enemies))+1]
+     local ai_type=rnd(1)<0.5 and "patrol" or "follow"
+     local ob={
+      pos={x,y},
+      typ=obj_types.hostile_npc,
+      rel={0,0},
+      frame=0,
+      animloop=true,
+      autoanim=true,
+      ai_type=ai_type,
+      patrol_index=0,
+      patrol_points={},
+      sprite_index=enemy_type.sprite
+     }
+     if ai_type=="patrol" then
+      for j=1,4 do
+       local px,py=find_spawn_point(rect)
+       if px then
+        add(ob.patrol_points,{x=px,y=py})
+       end
+      end
+      if #ob.patrol_points==0 then
+       add(ob.patrol_points,{x=x,y=y})
+      end
+     end
+     add(gen_objects,ob)
+    else
+     local ob={
+      pos={x,y},
+      typ=obj_types.non_hostile_npc,
+      rel={0,0},
+      frame=0,
+      animloop=true,
+      autoanim=false,
+      sprite_index=obj_types.non_hostile_npc.mx
+     }
+     add(gen_objects,ob)
+    end
+   end
+  end
+ end
+end
+
+function population.generate_items()
+ for node in all(gen_nodes) do
+  local rect=node.rect
+  local num_items=flr(rnd(gen_params.items_per_room))+1
+  
+  for i=1,num_items do
+   local x,y=find_spawn_point(rect)
+   if x then
+    if rnd(1)<0.6 then
+     local pickup_type=rnd(1)<0.5 and "heart" or "direct_pickup"
+     local obj_type=pickup_type=="heart" and obj_types.heart or obj_types.direct_pickup
+     local ob={
+      pos={x,y},
+      typ=obj_type,
+      rel={0,0},
+      frame=0,
+      animloop=true,
+      autoanim=true
+     }
+     add(gen_objects,ob)
+    else
+     local subtypes={"chest","shrine","trap","note"}
+     local subtype=subtypes[flr(rnd(#subtypes))+1]
+     local obj_type
+     if subtype=="chest" then
+      obj_type=obj_types.interactable_chest
+     elseif subtype=="shrine" then
+      obj_type=obj_types.interactable_shrine
+     elseif subtype=="trap" then
+      obj_type=obj_types.interactable_trap
+     else
+      obj_type=obj_types.interactable_note
+     end
+     local ob={
+      pos={x,y},
+      typ=obj_type,
+      rel={0,0},
+      frame=0,
+      animloop=true,
+      autoanim=false,
+      subtype=subtype
+     }
+     add(gen_objects,ob)
+    end
+   end
+  end
+ end
+end
+
+function population.generate_decorations()
+ local current_theme=gen_params.theme or "dng"
+ local theme_config=themes[current_theme] or themes.dng
+ local decor_prob=theme_config.decor_prob or 0.8
+ 
+ for node in all(gen_nodes) do
+  local rect=node.rect
+  local w,h=rect[3]-rect[1]+1,rect[4]-rect[2]+1
+  local room_decor_count=0
+  local max_decor=gen_params.max_decorations_per_room or 12
+  
+  for dec in all(decoration_types) do
+   if room_decor_count>=max_decor then break end
+   
+   local theme_match=false
+   if dec.theme_tags then
+    for tag in all(dec.theme_tags) do
+     if tag==current_theme then
+      theme_match=true
+      break
+     end
+    end
+   else
+    theme_match=true
+   end
+   
+   if theme_match and dec.gen_tags then
+    for tag in all(dec.gen_tags) do
+     if room_decor_count>=max_decor then break end
+     
+     if tag=="uni" and rnd(1)<0.3*decor_prob then
+      for dx=2,w-2,3 do
+       for dy=2,h-2,3 do
+        if room_decor_count>=max_decor then break end
+        if rnd(1)<0.5 then
+         local x,y=rect[1]+dx+0.5,rect[2]+dy+0.5
+         local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
+         add(gen_objects,ob)
+         room_decor_count+=1
+        end
+       end
+       if room_decor_count>=max_decor then break end
+      end
+      
+     elseif tag=="uni2" and rnd(1)<0.4*decor_prob then
+      for dx=1,w-1,2 do
+       for dy=1,h-1,2 do
+        if room_decor_count>=max_decor then break end
+        if rnd(1)<0.6 then
+         local x,y=rect[1]+dx+0.5,rect[2]+dy+0.5
+         local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
+         add(gen_objects,ob)
+         room_decor_count+=1
+        end
+       end
+       if room_decor_count>=max_decor then break end
+      end
+      
+     elseif tag=="scatter" and rnd(1)<0.2*decor_prob then
+      local count=flr(rnd(3))+1
+      for i=1,count do
+       if room_decor_count>=max_decor then break end
+       local x,y=find_spawn_point(rect)
+       if x then
+        local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
+        add(gen_objects,ob)
+        room_decor_count+=1
+       end
+      end
+      
+     elseif tag=="big" and rnd(1)<0.15*decor_prob then
+      if room_decor_count>=max_decor then break end
+      local cx,cy=flr((rect[1]+rect[3])/2)+0.5,flr((rect[2]+rect[4])/2)+0.5
+      if rnd(1)<0.5 then
+       local ob={pos={cx,cy},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
+       add(gen_objects,ob)
+       room_decor_count+=1
+      else
+       local corners={{rect[1]+1.5,rect[2]+1.5},{rect[3]-0.5,rect[2]+1.5},{rect[1]+1.5,rect[4]-0.5},{rect[3]-0.5,rect[4]-0.5}}
+       local corner=corners[flr(rnd(#corners))+1]
+       local ob={pos={corner[1],corner[2]},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
+       add(gen_objects,ob)
+       room_decor_count+=1
+      end
+      
+     elseif tag=="rare" and rnd(1)<0.05*decor_prob then
+      if room_decor_count>=max_decor then break end
+      local x,y=find_spawn_point(rect)
+      if x then
+       local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
+       add(gen_objects,ob)
+       room_decor_count+=1
+      end
+      
+     elseif tag=="lit" and rnd(1)<0.25*decor_prob then
+      if room_decor_count>=max_decor then break end
+      local walls={}
+      for x=rect[1]+1,rect[3]-1 do
+       if get_wall(x,rect[2])>0 then add(walls,{x+0.5,rect[2]+1.5}) end
+       if get_wall(x,rect[4])>0 then add(walls,{x+0.5,rect[4]-0.5}) end
+      end
+      for y=rect[2]+1,rect[4]-1 do
+       if get_wall(rect[1],y)>0 then add(walls,{rect[1]+1.5,y+0.5}) end
+       if get_wall(rect[3],y)>0 then add(walls,{rect[3]-0.5,y+0.5}) end
+      end
+      if #walls>0 then
+       local pos=walls[flr(rnd(#walls))+1]
+       local ob={pos={pos[1],pos[2]},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
+       add(gen_objects,ob)
+       room_decor_count+=1
+      end
+     end
+    end
+   end
+  end
+ end
+end
+
+return population
+
+:: src/procgen/dungeon/progression.lua
+--[[pod_format="raw",created="2025-11-18 13:35:00",modified="2025-11-18 13:35:00",revision=1]]
+
+local spacing = require("procgen.dungeon.spacing")
+
+local progression = {}
+
+local observability = spacing.observability
+local gen_log       = spacing.gen_log
+local protect_tile  = spacing.protect_tile
+
+local function get_edge_between(a,b)
+ for e in all(gen_edges) do
+  if (e.n1==a and e.n2==b) or (e.n1==b and e.n2==a) then
+   return e
+  end
+ end
+ return nil
+end
+
+local function locate_room_for_position(x,y)
+ for node in all(gen_nodes) do
+  local r=node.rect
+  if x>=r[1] and x<=r[3] and y>=r[2] and y<=r[4] then
+   return node
+  end
+ end
+ return nil
+end
+
+local function relocate_key_to_room(keynum,target_node)
+ if not target_node then return false end
+ local sx,sy=find_spawn_point(target_node.rect)
+ if not sx then
+  sx=target_node.midx+0.5
+  sy=target_node.midy+0.5
+ end
+ for ob in all(gen_objects) do
+  if ob.typ==obj_types.key and ob.keynum==keynum then
+   ob.pos={sx,sy}
+   ob.room_index=target_node.index
+   if observability.log_progression then
+    gen_log("progression","relocated key#"..keynum.." to room "..target_node.index)
+   end
+   return true
+  end
+ end
+ return false
+end
+
+local function validate_and_repair_progression(start_node,locked_edges)
+ if not locked_edges or #locked_edges==0 then return end
+ local key_rooms={}
+ for ob in all(gen_objects) do
+  if ob.typ==obj_types.key and ob.keynum then
+   if not ob.room_index then
+    local node=locate_room_for_position(ob.pos[1],ob.pos[2])
+    ob.room_index=node and node.index or nil
+   end
+   key_rooms[ob.keynum]=ob.room_index
+  end
+ end
+
+ local acquired={}
+ local visited={}
+ local queue={start_node}
+ visited[start_node]=true
+ local function collect_keys(node)
+  for ob in all(gen_objects) do
+   if ob.typ==obj_types.key and ob.keynum and ob.room_index==node.index then
+    acquired[ob.keynum]=true
+   end
+  end
+ end
+ collect_keys(start_node)
+ local progressed=true
+ while progressed do
+  progressed=false
+  for edge in all(gen_edges) do
+   local a,b=edge.n1,edge.n2
+   local a_vis=visited[a]
+   local b_vis=visited[b]
+   if a_vis and not b_vis then
+    local can_traverse=true
+    if edge.locked and edge.keynum and not acquired[edge.keynum] then
+     can_traverse=false
+    end
+    if can_traverse then
+     visited[b]=true
+     collect_keys(b)
+     progressed=true
+    end
+   elseif b_vis and not a_vis then
+    local can_traverse=true
+    if edge.locked and edge.keynum and not acquired[edge.keynum] then
+     can_traverse=false
+    end
+    if can_traverse then
+     visited[a]=true
+     collect_keys(a)
+     progressed=true
+    end
+   end
+  end
+ end
+
+ local relocated=false
+ for edge in all(locked_edges) do
+  if edge.locked and edge.keynum then
+   local n1_vis=visited[edge.n1]
+   local n2_vis=visited[edge.n2]
+   if not (n1_vis and n2_vis) then
+    if relocate_key_to_room(edge.keynum,start_node) then
+     relocated=true
+     acquired[edge.keynum]=true
+     visited[edge.n1]=true
+     visited[edge.n2]=true
+    end
+   end
+  end
+ end
+ if relocated then
+  validate_and_repair_progression(start_node,locked_edges)
+ end
+end
+
+local function find_accessible_rooms(start_node,locked_edges)
+ local accessible={}
+ local queue={start_node}
+ local visited={}
+ visited[start_node]=true
+ 
+ while #queue>0 do
+  local node=queue[1]
+  deli(queue,1)
+  add(accessible,node)
+  
+  for edge_node in all(node.edges) do
+   if not visited[edge_node] then
+    local is_locked=false
+    if locked_edges then
+     for le in all(locked_edges) do
+      if (le.n1==node and le.n2==edge_node) or (le.n1==edge_node and le.n2==node) then
+       is_locked=true
+       break
+      end
+     end
+    end
+    
+    if not is_locked then
+     visited[edge_node]=true
+     add(queue,edge_node)
+    end
+   end
+  end
+ end
+ 
+ return accessible
+end
+
+local function generate_progression_loop(start_node)
+ local locked_edges={}
+ local key_counter=1
+ 
+ local full_accessible=find_accessible_rooms(start_node,locked_edges)
+ 
+ local edges_shuffled={}
+ for e in all(gen_edges) do add(edges_shuffled,e) end
+ for i=#edges_shuffled,2,-1 do
+  local j=flr(rnd(i))+1
+  edges_shuffled[i],edges_shuffled[j]=edges_shuffled[j],edges_shuffled[i]
+ end
+ 
+ for gate_idx=1,#edges_shuffled do
+  if key_counter>3 then break end
+  
+  local edge=edges_shuffled[gate_idx]
+  local n1,n2=edge.n1,edge.n2
+  
+  local combined_locked={}
+  for le in all(locked_edges) do add(combined_locked,le) end
+  add(combined_locked,edge)
+  local test_accessible=find_accessible_rooms(start_node,combined_locked)
+  
+  if #test_accessible<#full_accessible then
+   local candidates={edge.b1,edge.b2}
+   local chosen=nil
+   for c in all(candidates) do
+    if c and c.x and c.y then
+     local wt=get_wall(c.x,c.y)
+     if is_door(wt) then
+      chosen=c
+      break
+     end
+    end
+   end
+   if chosen then
+    local x,y=chosen.x,chosen.y
+    local door=doorgrid[x] and doorgrid[x][y] or nil
+    if door then
+     set_wall(x,y,door_locked)
+     door.dtype=door_locked
+     door.keynum=key_counter
+     door.locked=true
+    else
+     set_wall(x,y,door_locked)
+     create_door(x,y,door_locked,key_counter)
+    end
+    protect_tile(x,y)
+    edge.locked=true
+    edge.keynum=key_counter
+    edge.lock_tile={x=x,y=y}
+    add(locked_edges,edge)
+    full_accessible=find_accessible_rooms(start_node,locked_edges)
+    add(gen_inventory,{type="key",keynum=key_counter})
+    if observability.log_progression then
+     gen_log("progression","locked edge "..n1.index.." <-> "..n2.index.." key#"..key_counter)
+    end
+    key_counter+=1
+   else
+    if observability.log_progression then
+     gen_log("progression","edge "..n1.index.." <-> "..n2.index.." missing door; skipped")
+    end
+   end
+  end
+ end
+ 
+ local failed_placements=0
+ local accessible=find_accessible_rooms(start_node,locked_edges)
+ while #gen_inventory>0 do
+  if #accessible>0 then
+   local room=accessible[flr(rnd(#accessible))+1]
+   local item=gen_inventory[1]
+   deli(gen_inventory,1)
+   
+   local x,y=find_spawn_point(room.rect)
+   if x then
+    failed_placements=0
+    if item.type=="key" then
+     local ob={pos={x,y},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum,room_index=room.index}
+     add(gen_objects,ob)
+    else
+     local ob={pos={x,y},typ=obj_types[item.type],rel={0,0},frame=0,animloop=true,autoanim=true}
+     add(gen_objects,ob)
+    end
+   else
+    if item.type=="key" then
+     local attempts=0
+     local placed=false
+     while attempts<15 and not placed do
+      local rr=accessible[flr(rnd(#accessible))+1]
+      local kx,ky=find_spawn_point(rr.rect)
+      if kx then
+       local ob={pos={kx,ky},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum,room_index=rr.index}
+       add(gen_objects,ob)
+       placed=true
+       break
+      end
+      attempts+=1
+     end
+     if not placed then
+      local sx,sy=find_spawn_point(start_node.rect)
+      if not sx then
+       sx=start_node.midx+0.5
+       sy=start_node.midy+0.5
+      end
+      local ob={pos={sx,sy},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum,room_index=start_node.index}
+      add(gen_objects,ob)
+     end
+    else
+     failed_placements+=1
+     if failed_placements>10 then
+      gen_log("items","failed to place items after multiple attempts; stopping")
+      break
+     end
+    end
+   end
+  else
+   break
+  end
+ end
+
+ validate_and_repair_progression(start_node,locked_edges)
+ gen_locked_edges=locked_edges
+end
+
+function progression.get_edge_between(a,b)
+ return get_edge_between(a,b)
+end
+
+function progression.locate_room_for_position(x,y)
+ return locate_room_for_position(x,y)
+end
+
+function progression.relocate_key_to_room(keynum,target_node)
+ return relocate_key_to_room(keynum,target_node)
+end
+
+function progression.validate_and_repair_progression(start_node,locked_edges)
+ return validate_and_repair_progression(start_node,locked_edges)
+end
+
+function progression.find_accessible_rooms(start_node,locked_edges)
+ return find_accessible_rooms(start_node,locked_edges)
+end
+
+function progression.generate_progression_loop(start_node)
+ return generate_progression_loop(start_node)
+end
+
+return progression
+
+:: src/procgen/dungeon/rooms.lua
+--[[pod_format="raw",created="2025-11-18 12:50:00",modified="2025-11-18 12:50:00",revision=1]]
+-- Room generation helpers for the dungeon pipeline
+
+local rooms = {}
+
+local function rect_area(rect)
+	return (rect[3] - rect[1] + 1) * (rect[4] - rect[2] + 1)
+end
+
+local function classify_room_style(rect)
+	local w = rect[3] - rect[1] + 1
+	local h = rect[4] - rect[2] + 1
+	local ratio = w / h
+	if ratio >= 1.8 then
+		return "hall_horizontal"
+	elseif ratio <= 0.55 then
+		return "hall_vertical"
+	elseif w * h >= 120 then
+		return "grand"
+	elseif w <= 6 and h <= 6 then
+		return "compact"
+	else
+		return "square"
+	end
+end
+
+local function choose_weighted(weights, default_key)
+	if not weights then return default_key end
+	local total = 0
+	for _, v in pairs(weights) do
+		total += v
+	end
+	if total <= 0 then return default_key end
+	local roll = rnd(total)
+	local acc = 0
+	for key, v in pairs(weights) do
+		acc += v
+		if roll <= acc then return key end
+	end
+	return default_key
+end
+
+function rooms.random_room(base_node, is_special)
+	local min_size = gen_params.min_size or 4
+	local max_size = gen_params.max_size or 12
+	if active_theme_rules and active_theme_rules.room_extra_size then
+		max_size += active_theme_rules.room_extra_size
+	end
+	if max_size < min_size then max_size = min_size end
+	local shape_weights = active_theme_rules and active_theme_rules.room_shape_weights
+	local shape = choose_weighted(shape_weights, "square")
+	local w, h
+	if is_special then
+		w, h = 12, 12
+	else
+		if shape == "hall_horizontal" then
+			w = flr(rnd(max_size - min_size + 1)) + min_size
+			h = max(min_size, flr(w * 0.5))
+		elseif shape == "hall_vertical" then
+			h = flr(rnd(max_size - min_size + 1)) + min_size
+			w = max(min_size, flr(h * 0.5))
+		elseif shape == "grand" then
+			w = max_size
+			h = max(min_size, max_size - 2)
+		else
+			w = flr(rnd(max_size - min_size + 1)) + min_size
+			h = flr(rnd(max_size - min_size + 1)) + min_size
+		end
+	end
+	w = min(w, max_size)
+	h = min(h, max_size)
+	w = max(w, min_size)
+	h = max(h, min_size)
+
+	local function sample_offset(range)
+		local bias = (active_theme_rules and active_theme_rules.center_bias) or adaptive_settings.offcenter_bias or 0.65
+		local magnitude = flr(range * (rnd() ^ bias))
+		if rnd(1) < 0.5 then magnitude = -magnitude end
+		return magnitude
+	end
+
+	local x, y
+	if base_node then
+		local radius = (active_theme_rules and active_theme_rules.bias_radius) or adaptive_settings.bias_radius or 12
+		local dx = sample_offset(radius)
+		local dy = sample_offset(radius)
+		x = base_node.midx + dx - flr(w / 2)
+		y = base_node.midy + dy - flr(h / 2)
+	else
+		local margin = 4
+		x = flr(rnd(map_size - w - margin * 2)) + margin
+		y = flr(rnd(map_size - h - margin * 2)) + margin
+	end
+
+	x = max(1, min(map_size - w - 2, x))
+	y = max(1, min(map_size - h - 2, y))
+
+	return { x, y, x + w - 1, y + h - 1 }
+end
+
+function rooms.add_room(rect, is_junction)
+	local index = #gen_nodes + 1
+	gen_rects[index] = rect
+	local style = classify_room_style(rect)
+	local node = {
+		rect = rect,
+		midx = flr((rect[1] + rect[3]) / 2),
+		midy = flr((rect[2] + rect[4]) / 2),
+		edges = {},
+		is_junction = is_junction or false,
+		style = style,
+		area = rect_area(rect),
+		theme = gen_params.theme,
+		metadata = {},
+		index = index
+	}
+	if observability.log_room_attempts then
+		gen_log("room", "added room " .. (#gen_nodes + 1) .. " style=" .. style .. " rect=(" .. rect[1] .. "," .. rect[2] .. ")-(" .. rect[3] .. "," .. rect[4] .. ")")
+	end
+	add(gen_nodes, node)
+	return node
+end
+
+return rooms
+
+:: src/procgen/dungeon/spacing.lua
+--[[pod_format="raw",created="2025-11-18 12:45:00",modified="2025-11-18 12:45:00",revision=1]]
+-- Spacing and observability helpers for dungeon generation.
+
+local spacing = {}
+
+-- observability + diagnostics configuration (defaults if configuration.lua did not define them)
+local observability = rawget(_G, "gen_observability") or {
+	enable_console = false,
+	capture_history = true,
+	history_limit = 400,
+	log_seed = true,
+	log_room_attempts = true,
+	log_corridors = true,
+	log_progression = true,
+	log_repairs = true
+}
+
+local adaptive_settings = rawget(_G, "gen_adaptive_settings") or {
+	spacing_relax_threshold = 4,
+	spacing_relax_step = 1,
+	spacing_max_relax = 4,
+	spacing_restore_delay = 2,
+	spacing_restore_step = 1,
+	max_room_failures = 20,
+	offcenter_bias = 0.65,
+	bias_radius = 12,
+	junction_retry_limit = 4,
+	corridor_jog_chance = 0.25
+}
+
+spacing.observability = observability
+spacing.adaptive_settings = adaptive_settings
+
+local gen_params = rawget(_G, "gen_params") or { spacing = 0 }
+
+local gen_history = {}
+local protected_tiles = {}
+local dynamic_spacing = 0
+local base_spacing = 0
+local spacing_restore_timer = 0
+local spacing_relaxations = 0
+local room_failure_streak = 0
+local total_room_failures = 0
+
+local function hist_push(entry)
+	if not observability.capture_history then return end
+	add(gen_history, entry)
+	if #gen_history > (observability.history_limit or 400) then
+		deli(gen_history, 1)
+	end
+end
+
+function spacing.gen_log(tag, msg)
+	local line = "[" .. tag .. "] " .. msg
+	hist_push(line)
+	if observability.enable_console then printh(line) end
+end
+
+function spacing.clear_protected()
+	protected_tiles = {}
+end
+
+function spacing.protect_tile(x, y)
+	if not x or not y then return end
+	protected_tiles[x] = protected_tiles[x] or {}
+	protected_tiles[x][y] = true
+end
+
+function spacing.is_tile_protected(x, y)
+	return protected_tiles[x] and protected_tiles[x][y] or false
+end
+
+local function reset_adaptive_spacing_internal()
+	base_spacing = gen_params.spacing or 0
+	dynamic_spacing = base_spacing
+	spacing_restore_timer = 0
+	spacing_relaxations = 0
+	room_failure_streak = 0
+	total_room_failures = 0
+end
+
+function spacing.reset_adaptive_spacing()
+	reset_adaptive_spacing_internal()
+end
+
+local function relax_spacing()
+	if spacing_relaxations >= (adaptive_settings.spacing_max_relax or 4) then return end
+	dynamic_spacing = max(0, dynamic_spacing - (adaptive_settings.spacing_relax_step or 1))
+	spacing_relaxations += 1
+	spacing_restore_timer = adaptive_settings.spacing_restore_delay or 2
+	spacing.gen_log("spacing", "relaxed spacing to " .. dynamic_spacing)
+end
+
+local function tick_spacing(success)
+	if success then
+		if spacing_restore_timer > 0 then
+			spacing_restore_timer -= 1
+		elseif dynamic_spacing < base_spacing then
+			dynamic_spacing = min(base_spacing, dynamic_spacing + (adaptive_settings.spacing_restore_step or 1))
+			if dynamic_spacing == base_spacing then
+				spacing_relaxations = 0
+			end
+			spacing.gen_log("spacing", "restored spacing to " .. dynamic_spacing)
+		end
+	else
+		if spacing_restore_timer > 0 then
+			spacing_restore_timer -= 1
+		end
+	end
+end
+
+function spacing.register_room_failure(reason)
+	room_failure_streak += 1
+	total_room_failures += 1
+	tick_spacing(false)
+	if observability.log_room_attempts then
+		spacing.gen_log("room_fail", reason .. " (streak=" .. room_failure_streak .. ")")
+	end
+	if room_failure_streak >= (adaptive_settings.spacing_relax_threshold or 4) then
+		relax_spacing()
+		room_failure_streak = 0
+	end
+end
+
+function spacing.register_room_success()
+	room_failure_streak = 0
+	tick_spacing(true)
+end
+
+function spacing.get_dynamic_spacing()
+	return dynamic_spacing
+end
+
+function spacing.clear_history()
+	gen_history = {}
+end
+
+function spacing.get_history()
+	return gen_history
+end
+
+return spacing
+
+:: src/procgen/dungeon/themes.lua
+--[[pod_format="raw",created="2025-11-18 12:30:00",modified="2025-11-18 12:30:00",revision=1]]
+-- Theme helpers for dungeon generation
+
+local themes_mod = {}
+
+-- Compute active theme rules for a given theme name.
+-- Does not mutate global state; caller owns storage.
+function themes_mod.ensure_theme_rules(theme_name, themes, adaptive_settings)
+	local rules = (themes[theme_name] and themes[theme_name].rules) or nil
+	local active = rules or {
+		room_aspect_bias = 0.35,
+		room_extra_size = 0,
+		spacing_floor = 0,
+		corridor_width = 1,
+		corridor_jog_chance = adaptive_settings.corridor_jog_chance or 0.25
+	}
+	return active
+end
+
+-- Random wall texture (never returns 0). Uses texsets from configuration.
+function themes_mod.random_wall_texture(texsets)
+	local set = texsets[flr(rnd(#texsets - 1)) + 2] -- skip texsets[1] which is floor
+	return set.variants[flr(rnd(#set.variants)) + 1]
+end
+
+-- Get theme-appropriate wall texture set from texsets.
+function themes_mod.theme_wall_texture(theme_name, texsets)
+	if theme_name == "out" then
+		-- outdoor: grass or earth variants (indices 5=grass, 6=earth)
+		local idx = rnd(1) < 0.5 and 5 or 6
+		return texsets[idx] or texsets[1]
+	elseif theme_name == "dem" then
+		-- demon: stone or cobblestone (4=stone, 2=cobblestone)
+		local idx = rnd(1) < 0.5 and 4 or 2
+		return texsets[idx] or texsets[1]
+	elseif theme_name == "house" then
+		-- house: wood plank (3=wood_plank)
+		return texsets[3] or texsets[1]
+	else
+		-- default dungeon: brick or cobblestone (1=brick, 2=cobblestone)
+		local idx = rnd(1) < 0.5 and 1 or 2
+		return texsets[idx] or texsets[1]
+	end
+end
+
+return themes_mod
+
+:: src/procgen/dungeon_factory.lua
+--[[pod_format="raw",created="2025-11-18 11:37:00",modified="2025-11-18 11:37:00",revision=1]]
+-- DungeonFactory: orchestrates world bootstrap and dungeon generation
+
+local log = require("log")
+local map_bootstrap = require("procgen.map_bootstrap")
+local map_state = require("procgen.map_state")
+
+include("src/procgen/dungeon/doors.lua")
+include("src/procgen/dungeon/pipeline.lua")
+
+local DungeonFactory = {
+	current_state = nil
+}
+
+function DungeonFactory.init(opts)
+	opts = opts or {}
+	log.info("[DungeonFactory] init")
+	map_bootstrap.init_world(opts)
+	return DungeonFactory
+end
+
+function DungeonFactory.generate(opts)
+	opts = opts or {}
+	log.info("[DungeonFactory] generate start")
+	local ok, err = pcall(function()
+		start_pos, gen_stats = generate_dungeon(opts)
+		DungeonFactory.current_state = map_state.build(map_bootstrap.get_context())
+	end)
+	if not ok then
+		log.error("[DungeonFactory] generation failed: %s", tostring(err))
+		wtf(tostring(err))
+	end
+	log.info("[DungeonFactory] generate done (rooms=%s, objects=%s)",
+		tostring(gen_stats and gen_stats.rooms), tostring(gen_stats and gen_stats.objects))
+	return DungeonFactory.current_state
+end
+
+function DungeonFactory.current()
+	return DungeonFactory.current_state
+end
+
+return DungeonFactory
+
+:: src/procgen/map_bootstrap.lua
+--[[pod_format="raw",created="2025-11-18 11:35:00",modified="2025-11-18 11:35:00",revision=1]]
+-- Map bootstrap: allocates userdata layers and establishes world globals
+
+local log = require("log")
+
+local map_bootstrap = {
+	context = nil
+}
+
+local function init_doorgrid(size)
+	local grid = {}
+	for i = 0, size - 1 do
+		grid[i] = {}
+	end
+	return grid
+end
+
+--- Initializes map userdata, helper accessors, and core gameplay tables.
+--- Returns a context table aliasing the live globals so downstream systems can
+--- reuse the references without searching the global namespace.
+function map_bootstrap.init_world(opts)
+	opts = opts or {}
+
+	log.info("[MapBootstrap] initializing world (size=%d)", map_size)
+
+	map = {}
+	map.walls = userdata("i16", map_size, map_size)
+	map.doors = userdata("i16", map_size, map_size)
+	map.floors = userdata("i16", map_size, map_size)
+
+	function get_wall(x, y)
+		if x >= 0 and x < map_size and y >= 0 and y < map_size then
+			return map.walls:get(x, y) or 0
+		end
+		return 0
+	end
+
+	function set_wall(x, y, val)
+		if x >= 0 and x < map_size and y >= 0 and y < map_size then
+			map.walls:set(x, y, val or 0)
+		end
+	end
+
+	function get_door(x, y)
+		if x >= 0 and x < map_size and y >= 0 and y < map_size then
+			return map.doors:get(x, y) or 0
+		end
+		return 0
+	end
+
+	function set_door(x, y, val)
+		if x >= 0 and x < map_size and y >= 0 and y < map_size then
+			map.doors:set(x, y, val or 0)
+		end
+	end
+
+	function get_floor(x, y)
+		if x >= 0 and x < map_size and y >= 0 and y < map_size then
+			return map.floors:get(x, y) or 0
+		end
+		return 0
+	end
+
+	function set_floor(x, y, val)
+		if x >= 0 and x < map_size and y >= 0 and y < map_size then
+			map.floors:set(x, y, val or 0)
+		end
+	end
+
+	doorgrid = init_doorgrid(map_size)
+	doors = {}
+	objects = {}
+	animated_objects = {}
+
+	player = {
+		x = 64,
+		y = 64,
+		a = 0,
+		spd = player_move_speed,
+		keys = {},
+		hp = 100
+	}
+
+	floor = { typ = planetyps[1], x = 0, y = 0 }
+	roof = { typ = planetyps[3], x = 0, y = 0 }
+
+	gen_stats = { rooms = 0, objects = 0, seed = 0, history = {} }
+	start_pos = { x = player.x, y = player.y }
+
+	local ctx = {
+		map = map,
+		doorgrid = doorgrid,
+		doors = doors,
+		objects = objects,
+		animated_objects = animated_objects,
+		player = player,
+		floor = floor,
+		roof = roof,
+		gen_stats = gen_stats,
+		start_pos = start_pos
+	}
+
+	map_bootstrap.context = ctx
+	return ctx
+end
+
+function map_bootstrap.get_context()
+	return map_bootstrap.context
+end
+
+return map_bootstrap
+
+:: src/procgen/map_state.lua
+--[[pod_format="raw",created="2025-11-18 11:36:00",modified="2025-11-18 11:36:00",revision=1]]
+local map_state = {}
+
+-- MapState snapshot for renderers, tools, and tests
+-- Purpose:
+--   Return a structured view over the *current* dungeon / gameplay state.
+--   The fields in the returned table alias the live globals (map, doors,
+--   doorgrid, objects, player, gen_nodes, gen_edges, gen_stats, etc.).
+--   It does *not* create a second copy of the world state.
+-- Schema (keys on the returned table):
+--   map_size           : integer grid size (configuration.map_size)
+--   get_wall/set_wall  : functions for walls layer
+--   get_floor/set_floor: functions for floor layer
+--   doors              : array of door objects
+--   doorgrid           : door lookup table [x][y] -> door or nil
+--   objects            : array of gameplay objects (npcs, items, decor, exits)
+--   animated_objects   : subset of objects with autoanim=true
+--   player_start       : { x, y } spawn position from last generation
+--   player             : player state table
+--   floor, roof        : global floor/ceiling scroll state
+--   gen_nodes          : room/junction graph nodes
+--   gen_edges          : corridor edges between nodes
+--   gen_locked_edges   : edges chosen as progression gates
+--   gen_stats          : { rooms, objects, seed, history }
+--   planetyps, texsets : configuration tables from configuration.lua
+--   door_normal/...    : door and exit tile id constants
+--   is_door/is_exit    : helper predicates for tile classification
+function map_state.build(context)
+	local state = {}
+
+	state.map_size = map_size
+
+	state.get_wall = get_wall
+	state.get_floor = get_floor
+	state.set_wall = set_wall
+	state.set_floor = set_floor
+
+	state.doors = context.doors or doors
+	state.doorgrid = context.doorgrid or doorgrid
+
+	state.objects = context.objects or objects
+	state.animated_objects = context.animated_objects or animated_objects
+
+	state.player_start = { x = start_pos and start_pos.x or player.x, y = start_pos and start_pos.y or player.y }
+	state.player = context.player or player
+
+	state.floor = context.floor or floor
+	state.roof = context.roof or roof
+
+	state.gen_nodes = gen_nodes
+	state.gen_edges = gen_edges
+	state.gen_locked_edges = gen_locked_edges
+
+	state.gen_stats = gen_stats
+
+	state.planetyps = planetyps
+	state.texsets = texsets
+	state.door_normal = door_normal
+	state.door_locked = door_locked
+	state.door_stay_open = door_stay_open
+	state.exit_start = exit_start
+	state.exit_end = exit_end
+
+	state.is_door = is_door
+	state.is_exit = is_exit
+
+	return state
+end
+
+return map_state
+
+:: src/render/dungeon_map_renderer.lua
+--[[pod_format="raw",created="2025-11-18 15:45:00",modified="2025-11-18 15:45:00",revision=1]]
+-- Dungeon map renderer (2D top-down) built on MapState contract
+
+local renderer = {}
+
+local colors = {
+	void = 0,
+	floor = 1,
+	wall = 5,
+	door = 10,
+	exit = 8,
+	player = 12,
+	object = 9
+}
+
+local function draw_cell(px, py, scale, col)
+	rectfill(px, py, px + scale - 1, py + scale - 1, col)
+end
+
+local function choose_tile_color(state, tile)
+	if not tile or tile == 0 then
+		return colors.floor
+	end
+	if state.is_exit and state.is_exit(tile) then
+		return colors.exit
+	end
+	if state.is_door and state.is_door(tile) then
+		return colors.door
+	end
+	return colors.wall
+end
+
+function renderer.draw(state, opts)
+	if not state or not state.get_wall then return end
+	opts = opts or {}
+	local origin_x = opts.x or 4
+	local origin_y = opts.y or 4
+	local max_w = opts.max_width or 256
+	local max_h = opts.max_height or 256
+
+	local map_size = state.map_size or 0
+	if map_size <= 0 then return end
+
+	local scale = math.max(1, math.floor(math.min(max_w / map_size, max_h / map_size)))
+	local clipped_w = map_size * scale
+	local clipped_h = map_size * scale
+	clip(origin_x, origin_y, origin_x + clipped_w, origin_y + clipped_h)
+
+	for y = 0, map_size - 1 do
+		local py = origin_y + y * scale
+		for x = 0, map_size - 1 do
+			local px = origin_x + x * scale
+			local tile = state.get_wall(x, y)
+			local color = choose_tile_color(state, tile)
+			if tile == 0 then
+				local floor_tile = state.get_floor and state.get_floor(x, y) or 0
+				color = floor_tile > 0 and colors.floor or colors.void
+			end
+			draw_cell(px, py, scale, color)
+		end
+	end
+
+	clip()
+
+	local function draw_marker(world_x, world_y, col)
+		if not world_x or not world_y then return end
+		local px = origin_x + math.floor(world_x * scale)
+		local py = origin_y + math.floor(world_y * scale)
+		rectfill(px - 1, py - 1, px + 1, py + 1, col)
+	end
+
+	if state.player_start then
+		draw_marker(state.player_start.x or 0, state.player_start.y or 0, colors.player)
+	end
+
+	if state.objects then
+		for obj in all(state.objects) do
+			local pos = obj.pos
+			local ox = pos and (pos[1] or pos.x) or obj.x
+			local oy = pos and (pos[2] or pos.y) or obj.y
+			draw_marker(ox or 0, oy or 0, colors.object)
+		end
+	end
+
+	if state.gen_nodes then
+		for node in all(state.gen_nodes) do
+			local rect = node.rect
+			if rect then
+				local x0 = origin_x + rect[1] * scale
+				local y0 = origin_y + rect[2] * scale
+				local x1 = origin_x + rect[3] * scale
+				local y1 = origin_y + rect[4] * scale
+				rect(x0, y0, x1, y1, 13)
+			end
+		end
+	end
+end
+
+return renderer
+
+:: .info.pod
+--[[pod,created="2025-11-07 22:14:20",modified="2025-11-18 18:11:48",runtime=23,workspaces={{location="main.lua#828",workspace_index=1}}]]
+:: lib/.info.pod
+--[[pod,created="2025-11-18 01:18:07",modified="2025-11-18 18:11:48"]]
+:: lib/docs/.info.pod
+--[[pod,created="2025-11-18 01:18:07",modified="2025-11-18 18:11:48"]]
+:: lib/docs/ECS.md
+b64$VGhlIGBlY3MubHVhYCBmaWxlIGNvbnRhaW5zIHRoZSBlbnRpcmUgRUNTIGZyYW1ld29yay4g
+VGhlIHJlc3Qgb2YgdGhpcyByZXBvc2l0b3J5IGlzIGEgZGVtbyB3aGljaCBib3RoIHNob3dzIHRo
+ZSBmcmFtZXdvcmsgaW4gdXNlLCBhbmQgcHJvdmlkZXMgYSBjb25jcmV0ZSBzYW1wbGUgb2YgaG93
+IHRvIHVzZSBpdC4NCg0KIyMgQVBJDQojIyMgYGVjc2ANClRoZSBFQ1MgZnJhbWV3b3JrIG1vZHVs
+ZS4NCg0KYGVjcy53b3JsZChiaXRtYXNrX3NpemUpYCBDcmVhdGVzIGEgbmV3IHdvcmxkLg0KLSBg
+Yml0bWFza19zaXplYCBbb3B0aW9uYWxdIC0gVGhlIG51bWJlciBvZiA2NC1iaXQgaW50ZWdlcnMg
+dG8gdXNlIGZvciBiaXRtYXNrcy4gRGVmYXVsdCBpcyA0LiBZb3UgY2FuIHJlZ2lzdGVyIHVwIHRv
+IGJpdG1hc2tfc2l6ZSo2NCBjb21wb25lbnRzIGluIGEgd29ybGQsIGJ1dCBoaWdoZXIgbnVtYmVy
+cyBoYXZlIGEgc21hbGwgcGVyZm9ybWFuY2UgY29zdC4NCi0gKipSZXR1cm5zOioqIFRoZSB3b3Js
+ZCBvYmplY3QuDQoNCmBlY3MuY29tcCh3b3JsZCx0YWIsa2V5LGNvbnN0cnVjdG9yKWAgQ3JlYXRl
+cyBhIG5ldyBjb21wb25lbnQgdHlwZS4NCi0gYHdvcmxkYCBbb3B0aW9uYWxdIC0gVGhlIHdvcmxk
+IG9iamVjdCB0byByZWdpc3RlciB0aGUgY29tcG9uZW50IHdpdGguDQotIGB0YWJgIFtvcHRpb25h
+bF0gLSBUaGUgdGFibGUgdG8gcHV0IHRoZSBjb21wb25lbnQgaW4uDQotIGBrZXlgIC0gVGhlIG5h
+bWUgb2YgdGhlIGNvbXBvbmVudCB0eXBlLg0KLSBgY29uc3RydWN0b3JgIC0gVGhlIGZ1bmN0aW9u
+IHdoaWNoIGNyZWF0ZXMgYSBuZXcgaW5zdGFuY2Ugb2YgdGhlIGNvbXBvbmVudC4NCi0gKipSZXR1
+cm5zOioqIEEgY29tcG9uZW50IHR5cGUgdGFibGUgd2hpY2ggY2FuIGJlIGNhbGxlZCB0byBjcmVh
+dGUgbmV3IGNvbXBvbmVudHMuDQoNCmBlY3Muc3lzKHdvcmxkLGluY2x1ZGUsZXhjbHVkZSxmdW5j
+KWAgQ3JlYXRlcyBhIG5ldyBzZXQgb2Ygc3lzdGVtIGRhdGEuDQotIGB3b3JsZGAgW29wdGlvbmFs
+XSAtIFRoZSB3b3JsZCBvYmplY3QgdG8gcmVnaXN0ZXIgdGhlIHN5c3RlbSB3aXRoLg0KLSBgaW5j
+bHVkZWAgLSBUaGUgY29tcG9uZW50cyB3aGljaCBlbnRpdGllcyBtdXN0IGhhdmUgdG8gYmUgaW5j
+bHVkZWQgaW4gdGhlIHF1ZXJ5Lg0KLSBgZXhjbHVkZWAgW29wdGlvbmFsXSAtIFRoZSBjb21wb25l
+bnRzIHdoaWNoIGVudGl0aWVzIG11c3Qgbm90IGhhdmUgdG8gYmUgaW5jbHVkZWQgaW4gdGhlIHF1
+ZXJ5DQotIGBmdW5jYCAtIFRoZSBmdW5jdGlvbiB3aGljaCBwcm9jZXNzZXMgcmVjZWl2ZXMgdGhl
+IHF1ZXJ5IGFuZCBwcm9jZXNzZXMgdGhlIGVudGl0aWVzLg0KLSAqKlJldHVybnM6KiogVGhlIHN5
+c3RlbSBkYXRhLg0KDQojIyMgYHdvcmxkYA0KQSBzaW5nbGUgaW5kZXBlbmRlbnQgaW5zdGFuY2Ug
+b2YgYW4gRUNTLg0KDQpgd29ybGQ6Y29tcCh0YWIsa2V5LGNvbnN0cnVjdG9yKWAgQWxpYXMgZm9y
+IGBlY3MuY29tcCh3b3JsZCx0YWIsa2V5LGNvbnN0cnVjdG9yKWAgd2hpY2ggYXV0b21hdGljYWxs
+eSByZWdpc3RlcnMgdGhlIGNvbXBvbmVudCB3aXRoIHRoZSB3b3JsZC4NCg0KYHdvcmxkOnN5cyhp
+bmNsdWRlLGV4Y2x1ZGUsZnVuYylgIEFsaWFzIGZvciBgZWNzLnN5cyh3b3JsZCxpbmNsdWRlLGV4
+Y2x1ZGUsZnVuYylgIHdoaWNoIGF1dG9tYXRpY2FsbHkgcmVnaXN0ZXJzIHRoZSBzeXN0ZW0gd2l0
+aCB0aGUgd29ybGQuDQoNCmB3b3JsZDpyZWdfY29tcChjb21wX3R5cGUpYCBSZWdpc3RlcnMgYSBj
+b21wb25lbnQgdHlwZSB3aXRoIHRoZSB3b3JsZC4NCi0gYGNvbXBfdHlwZWAgLSBUaGUgY29tcG9u
+ZW50IHR5cGUgdG8gcmVnaXN0ZXIuDQotICoqUmV0dXJuczoqKiBUaGUgd29ybGQgb2JqZWN0LCBm
+b3IgY2hhaW5pbmcuDQoNCmB3b3JsZDpyZWdfc3lzKHN5c19kYXRhKWAgUmVnaXN0ZXJzIGEgc3lz
+dGVtIHdpdGggdGhlIHdvcmxkLg0KLSBgc3lzdGVtX2RhdGFgIC0gVGhlIHN5c3RlbSBkYXRhIHRv
+IHJlZ2lzdGVyLg0KLSAqKlJldHVybnM6KiogVGhlIHdvcmxkIG9iamVjdCwgZm9yIGNoYWluaW5n
+Lg0KDQpgd29ybGQ6ZW50KClgIENyZWF0ZXMgYSBuZXcgZW50aXR5Lg0KLSAqKlJldHVybnM6Kiog
+VGhlIGVudGl0eS4NCg0KYHdvcmxkOnJ1bihzeXNfZGF0YSwuLi4pYCBFeGVjdXRlcyBhIHN5c3Rl
+bSBmb3IgdGhlIHdvcmxkLg0KLSBgc3lzX2RhdGFgIC0gVGhlIHN5c3RlbSBkYXRhIHRvIGV4ZWN1
+dGUuDQotIGAuLi5gIC0gQWRkaXRpb25hbCBhcmd1bWVudHMgdG8gcGFzcyB0byB0aGUgc3lzdGVt
+Lg0KLSAqKlJldHVybnM6KiogVGhlIHdvcmxkIG9iamVjdCwgZm9yIGNoYWluaW5nLg0KDQojIyMg
+YHF1ZXJ5YA0KQW4gaXRlcmF0b3Igd2hpY2ggcmV0dXJucyBhIGNvbXBvbmVudCBmb3IgZWFjaCBl
+bnRyeSBpbiBhIHN5c3RlbSdzIGBpbmNsdWRlYCBhcmd1bWVudCwgcGx1cyB0aGUgZW50aXR5IHdo
+aWNoIHBvc3Nlc3NlcyB0aGVtLg0KDQojIyMgYGVudGl0eWANCmBlbnRpdHkuY29tcHNgIEEgbWFw
+IG9mIGFsbCBjb21wb25lbnRzIG9uIHRoZSBlbnRpdHkuIEtleXMgYXJlIGNvbXBvbmVudCB0eXBl
+IG5hbWVzLCB2YWx1ZXMgYXJlIGNvbXBvbmVudHMuIENhbiBiZSB1c2VkIHRvIGZldGNoIG9wdGlv
+bmFsIGNvbXBvbmVudHMgb3IgdGhlIGNvbXBvbmVudHMgb2YgcmVmZXJlbmNlZCBlbnRpdGllcyBk
+dXJpbmcgc3lzdGVtIGV4ZWN1dGlvbi4NCg0KYGVudGl0eTphZGQoY29tcCxrZXkpYCBBZGRzIGEg
+Y29tcG9uZW50IHRvIHRoZSBlbnRpdHkuIENhbGxpbmcgYSBmdW5jdGlvbiBjcmVhdGVkIGJ5IGBl
+Y3MuY29tcGAgd2lsbCByZXR1cm4gYm90aCBhcmd1bWVudHMgYXQgb25jZS4NCi0gYGNvbXBgIC0g
+VGhlIGNvbXBvbmVudCB0byBhZGQuDQotIGBrZXlgIC0gVGhlIG5hbWUgb2YgdGhlIGNvbXBvbmVu
+dCB0eXBlLg0KLSAqKlJldHVybnM6KiogVGhlIGVudGl0eSwgZm9yIGNoYWluaW5nLg0KDQpgZW50
+aXR5OnJlbW92ZShrZXkpYCBSZW1vdmVzIGEgY29tcG9uZW50IGZyb20gdGhlIGVudGl0eS4gTm90
+ZSB0aGF0IHRoZSBhY3Qgb2YgcmVtb3ZpbmcgaXQgZnJvbSB0aGUgYGVudGl0eS5jb21wc2AgdGFi
+bGUgaXMgZGVmZXJyZWQgdW50aWwgdGhlIG5leHQgc3lzdGVtIGV4ZWN1dGlvbiBjYWxsLg0KLSBg
+a2V5YCAtIFRoZSBuYW1lIG9mIHRoZSBjb21wb25lbnQgdHlwZS4NCi0gKipSZXR1cm5zOioqIFRo
+ZSBlbnRpdHksIGZvciBjaGFpbmluZy4NCg0KYGVudGl0eTpyZWYoKWAgQ3JlYXRlcyBhIHdlYWsg
+cmVmZXJlbmNlIHRvIHRoZSBlbnRpdHkuIFVzZWZ1bCBmb3IgcmVmZXJlbmNpbmcgZW50aXRpZXMg
+ZnJvbSBvdGhlciBlbnRpdGllcy4NCi0gKipSZXR1cm5zOioqIEEgY2FsbGFibGUgdGFibGUuIFdo
+ZW4gY2FsbGVkLCBpdCB3aWxsIHJldHVybiB0aGUgZW50aXR5IGlmIGl0IHN0aWxsIGV4aXN0cywg
+b3IgbmlsIGlmIG5vdC4NCg0KYGVudGl0eTpkZXN0cm95KClgIFF1ZXVlcyB0aGUgZW50aXR5IGZv
+ciBkZXN0cnVjdGlvbi4gVXNlIHRoaXMgKipkdXJpbmcqKiBzeXN0ZW0gZXhlY3V0aW9uLg0KDQpg
+ZW50aXR5OmRlc3Ryb3lfaW1tZWRpYXRlKClgIERlc3Ryb3lzIHRoZSBlbnRpdHkuIFVzZSB0aGlz
+ICoqb3V0c2lkZSoqIG9mIHN5c3RlbSBleGVjdXRpb24uDQ==
+:: lib/docs/LoggingSystem.md
+b64$IyMgTG9nZ2luZyBTeXN0ZW0NCg0KVGhpcyB0ZW1wbGF0ZSBpbmNsdWRlcyBhIGNvbXByZWhl
+bnNpdmUgbG9nZ2luZyBzeXN0ZW0gdG8gdHJhY2sgZ2FtZSBldmVudHMsIGRlYnVnIGluZm9ybWF0
+aW9uLCBhbmQgZXJyb3JzLiBUaGUgc3lzdGVtIGFsbG93cyB5b3UgdG8gbG9nIG1lc3NhZ2VzIHRv
+IGVpdGhlciB0aGUgY29uc29sZSBvciBhbiBleHRlcm5hbCBwcm9jZXNzLCBzdWNoIGFzIHRoZSBp
+bmNsdWRlZCBsb2cgdmlld2VyLCBwcm92aWRpbmcgcmVhbC10aW1lIHZpc2liaWxpdHkgaW50byB5
+b3VyIGdhbWXigJlzIGJlaGF2aW9yLg0KDQoxLiAqKkxvZyBMZXZlbHMqKjoNCiAgICBEaWZmZXJl
+bnQgbG9nIGxldmVscyBjb250cm9sIHRoZSB2ZXJib3NpdHkgb2YgdGhlIG91dHB1dC4gU2V0IHRo
+ZSBhcHByb3ByaWF0ZSBsb2cgbGV2ZWwgYmVmb3JlIGluaXRpYWxpemluZyB0aGUgbG9nZ2luZyBz
+eXN0ZW0uIEF2YWlsYWJsZSBsb2cgbGV2ZWxzIGFyZToNCiAgICAtIGBUUkFDRWA6IFZlcnkgZGV0
+YWlsZWQgbG9nZ2luZywgdXNlZnVsIGZvciB0cmFjaW5nIGZ1bmN0aW9uIGNhbGxzLg0KICAgIC0g
+YERFQlVHYDogRGV0YWlsZWQgaW5mb3JtYXRpb24gdG8gaGVscCB3aXRoIGRlYnVnZ2luZy4NCiAg
+ICAtIGBJTkZPYDogR2VuZXJhbCBnYW1lIGV4ZWN1dGlvbiBpbmZvcm1hdGlvbiAoZS5nLiwgIkdh
+bWUgc3RhcnRlZCIpLg0KICAgIC0gYFdBUk5gOiBXYXJuaW5ncyBhYm91dCBwb3RlbnRpYWwgaXNz
+dWVzIHRoYXQgZG8gbm90IHN0b3AgdGhlIGdhbWUuDQogICAgLSBgRVJST1JgOiBDcml0aWNhbCBl
+cnJvcnMgcmVxdWlyaW5nIGltbWVkaWF0ZSBhdHRlbnRpb24uDQoNCjIuICoqTG9nIFRhcmdldHMq
+KjoNCiAgICBMb2dzIGNhbiBiZSBkaXJlY3RlZCB0byBlaXRoZXI6DQogICAgLSAqKkNvbnNvbGUq
+KjogTG9ncyBwcmludGVkIGRpcmVjdGx5IGluIHRoZSBjb25zb2xlLg0KICAgIC0gKipFeHRlcm5h
+bCBQcm9jZXNzKio6IExvZ3Mgc2VudCB0byBhbiBleHRlcm5hbCBwcm9jZXNzIHN1Y2ggYXMgdGhl
+IGxvZyB2aWV3ZXIgKGBsb2d2aWV3Lmx1YWApLg0KDQozLiAqKkV4dGVybmFsIExvZ2dpbmcqKjoN
+CiAgICBXaGVuIGxvZ2dpbmcgdG8gYW4gZXh0ZXJuYWwgcHJvY2VzcywgdGhlIHN5c3RlbSBzZW5k
+cyBtZXNzYWdlcyB0byBhbm90aGVyIHByb2dyYW0gKGUuZy4sIGBsb2d2aWV3Lmx1YWApLCBhbGxv
+d2luZyByZWFsLXRpbWUgbW9uaXRvcmluZyBpbiBhIHNlcGFyYXRlIHdpbmRvdy4NCg0KNC4gKipU
+aW1lc3RhbXBlZCBFbnRyaWVzKio6DQogICAgRWFjaCBsb2cgZW50cnkgaXMgYXV0b21hdGljYWxs
+eSB0aW1lc3RhbXBlZCwgd2hpY2ggaGVscHMgd2l0aCBkZWJ1Z2dpbmcgYW5kIHRyYWNraW5nIGV2
+ZW50IG9yZGVyLg0KDQo1LiAqKkR5bmFtaWMgQ29udHJvbCBPdmVyIExvZ2dpbmcqKjoNCiAgICBB
+ZGp1c3QgdGhlIGxvZyBsZXZlbCB0byBjb250cm9sIHdoaWNoIG1lc3NhZ2VzIGFyZSBsb2dnZWQu
+IEZvciBleGFtcGxlLCBzZXR0aW5nIHRoZSBsb2cgbGV2ZWwgdG8gYEVSUk9SYCB3aWxsIG9ubHkg
+bG9nIGNyaXRpY2FsIGVycm9ycy4NCg0KIyMjIFVzaW5nIHRoZSBMb2dnaW5nIFN5c3RlbQ0KDQox
+LiAqKlNldHRpbmcgTG9nIExldmVsIGFuZCBUYXJnZXQqKjoNCiAgICBTZXQgdGhlIGxvZyBsZXZl
+bCBhbmQgdGFyZ2V0IGJlZm9yZSBjYWxsaW5nIGBpbml0KClgLg0KDQogICAgRXhhbXBsZToNCiAg
+ICBgYGBsdWENCiAgICBsb2cuc2V0X2xldmVsKGxvZy5sZXZlbHMuREVCVUcpICAgICAgLS0gU2V0
+IGxvZyBsZXZlbCB0byBERUJVRw0KICAgIGxvZy5zZXRfdGFyZ2V0KGxvZy50YXJnZXRzLkNPTlNP
+TEUpICAtLSBTZXQgbG9nIHRhcmdldCB0byBjb25zb2xlDQogICAgbG9nLmluaXQoKSAgICAgICAg
+ICAgICAgICAgICAgICAgICAgIC0tIEluaXRpYWxpemUgbG9nZ2luZw0KICAgIGBgYA0KDQoyLiAq
+KkxvZ2dpbmcgTWVzc2FnZXMqKjoNCiAgICBMb2cgbWVzc2FnZXMgYXQgZGlmZmVyZW50IGxldmVs
+cyAoYFRSQUNFYCwgYERFQlVHYCwgYElORk9gLCBgV0FSTmAsIGBFUlJPUmApLg0KDQogICAgYGBg
+bHVhDQogICAgbG9nLmluZm8oIkdhbWUgaW5pdGlhbGl6ZWQiKSAgICAgICAtLSBMb2dzIGFuIGlu
+Zm8gbWVzc2FnZQ0KICAgIGxvZy5lcnJvcigiRmFpbGVkIHRvIGxvYWQgYXNzZXQiKSAgLS0gTG9n
+cyBhbiBlcnJvciBtZXNzYWdlDQogICAgYGBgDQoNCjMuICoqUmVpbml0aWFsaXppbmcgdGhlIExv
+ZyBTeXN0ZW0qKjoNCiAgICBJZiB5b3UgY2hhbmdlIHRoZSBsb2cgbGV2ZWwgb3IgdGFyZ2V0IGFm
+dGVyIHRoZSBpbml0aWFsIHNldHVwLCByZWluaXRpYWxpemUgdGhlIGxvZ2dpbmcgc3lzdGVtIGJ5
+IGNhbGxpbmcgYGluaXQoKWAgYWdhaW4uDQoNCiAgICBgYGBsdWENCiAgICBsb2cuc2V0X2xldmVs
+KGxvZy5sZXZlbHMuVFJBQ0UpICAgICAgICAgICAgICAgLS0gQ2hhbmdlIGxvZyBsZXZlbCB0byBU
+UkFDRQ0KICAgIGxvZy5zZXRfdGFyZ2V0KGxvZy50YXJnZXRzLkVYVEVSTkFMX1BST0NFU1MpICAt
+LSBDaGFuZ2UgdGFyZ2V0IHRvIGV4dGVybmFsIHByb2Nlc3MNCiAgICBsb2cuaW5pdCgpICAgICAg
+ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgLS0gUmVpbml0aWFsaXplIGxvZ2dpbmcgc3lz
+dGVtDQogICAgYGBgDQoNCjQuICoqVHJhY2luZyBGdW5jdGlvbiBDYWxscyoqOg0KICAgIFVzZSBg
+dHJhY2VfZnVuY3Rpb24oKWAgdG8gbG9nIGZ1bmN0aW9uIGVudHJ5IGFuZCBleGl0IHBvaW50cywg
+bWFraW5nIGl0IGVhc2llciB0byB0cmFjZSB0aGUgZmxvdyBvZiBmdW5jdGlvbiBjYWxscy4NCg0K
+ICAgIGBgYGx1YQ0KICAgIGxvY2FsIHJlc3VsdCA9IGxvZy50cmFjZV9mdW5jdGlvbigibW92ZV9w
+bGF5ZXIiLCBtb3ZlX3BsYXllciwgcGxheWVyLCBkeCwgZHkpDQogICAgYGBgDQoNCiMjIyBMb2dn
+aW5nIEV4YW1wbGUNCg0KYGBgbHVhDQpsb2cuc2V0X2xldmVsKGxvZy5sZXZlbHMuSU5GTykNCmxv
+Zy5zZXRfdGFyZ2V0KGxvZy50YXJnZXRzLkVYVEVSTkFMX1BST0NFU1MpDQpsb2cuaW5pdCgpICAt
+LSBJbml0aWFsaXplIGxvZ2dpbmcNCg0KbG9nLmluZm8oIkdhbWUgc3RhcnRlZCIpDQpsb2cud2Fy
+bigiTG93IHBsYXllciBoZWFsdGggZGV0ZWN0ZWQiKQ0KDQppZiBub3QgcGxheWVyIHRoZW4NCiAg
+ICBsb2cuZXJyb3IoIkZhaWxlZCB0byBsb2FkIHBsYXllciBkYXRhIikNCmVuZA0KYGBgDQoNCiMj
+IyBMb2cgVmlld2VyIChgbG9ndmlldy5sdWFgKQ0KDQpUaGUgYGxvZ3ZpZXcubHVhYCBzY3JpcHQg
+cHJvdmlkZXMgYSBncmFwaGljYWwgaW50ZXJmYWNlIGZvciB2aWV3aW5nIGxvZyBtZXNzYWdlcyBp
+biByZWFsLXRpbWUuIEl0IGRpc3BsYXlzIHVwIHRvIDUwMCBsb2cgZW50cmllcywgcmVtb3Zpbmcg
+dGhlIG9sZGVzdCBlbnRyaWVzIGFzIG5ldyBvbmVzIGFyZSBhZGRlZC4NCg0KIyMjIEltcG9ydGFu
+dCBOb3Rlcw0KLSBBbHdheXMgc2V0IHRoZSBsb2cgbGV2ZWwgYW5kIHRhcmdldCAqKmJlZm9yZSoq
+IGNhbGxpbmcgYGxvZy5pbml0KClgLg0KLSBSZWluaXRpYWxpemUgdGhlIGxvZ2dpbmcgc3lzdGVt
+IGlmIHRoZSBsb2cgbGV2ZWwgb3IgdGFyZ2V0IGlzIGNoYW5nZWQgYWZ0ZXIgaW5pdGlhbGl6YXRp
+b24u
+:: lib/docs/Require.md
+b64$IyMgTHVhIGByZXF1aXJlKClgIGFuZCBNb2R1bGUgU3lzdGVtDQoNClRoaXMgdGVtcGxhdGUg
+aW5jbHVkZXMgYSBjdXN0b20gaW1wbGVtZW50YXRpb24gb2YgdGhlIEx1YSBgcmVxdWlyZSgpYCBm
+dW5jdGlvbiwgY29tcGF0aWJsZSB3aXRoIEx1YSA1LjQsIHRvIHNpbXBsaWZ5IG1vZHVsZSBsb2Fk
+aW5nIGFuZCBjYWNoaW5nLCBtYWtpbmcgeW91ciBnYW1lIGVhc2llciB0byBtYW5hZ2UgYW5kIHRl
+c3QuDQoNCjEuICoqTW9kdWxhciBEZXNpZ24qKjoNCiAgICBPcmdhbml6ZSB5b3VyIGNvZGUgYnkg
+ZGlzdHJpYnV0aW5nIGZ1bmN0aW9uYWxpdHkgYWNyb3NzIGRpZmZlcmVudCBtb2R1bGVzIChmaWxl
+cykuIE1vZHVsZXMgY2FuIGNvbnRhaW4gZ2FtZSBsb2dpYywgdXRpbGl0aWVzLCBvciBjb25maWd1
+cmF0aW9uIHNldHRpbmdzLiBVc2UgYHJlcXVpcmUoKWAgdG8gbG9hZCB0aGVtLg0KDQoyLiAqKk1v
+ZHVsZSBDYWNoaW5nKio6DQogICAgT25jZSBhIG1vZHVsZSBpcyBsb2FkZWQsIGl0IGlzIGNhY2hl
+ZCB0byBhdm9pZCBtdWx0aXBsZSByZWxvYWRzLCBpbXByb3ZpbmcgcGVyZm9ybWFuY2UgYnkgcmV1
+c2luZyBsb2FkZWQgbW9kdWxlcy4NCg0KMy4gKipVc2luZyBgcmVxdWlyZSgpYCB0byBMb2FkIE1v
+ZHVsZXMqKjoNCiAgICBMb2FkIGEgbW9kdWxlIHVzaW5nIGl0cyBmaWxlbmFtZS4gVGhlIGByZXF1
+aXJlKClgIGZ1bmN0aW9uIHJldHVybnMgdGhlIG1vZHVsZSdzIGNvbnRlbnQsIHR5cGljYWxseSBh
+IHRhYmxlIG9mIGZ1bmN0aW9ucyBvciBkYXRhLg0KDQogICAgRXhhbXBsZToNCiAgICBgYGBsdWEN
+CiAgICBsb2NhbCBwbGF5ZXIgPSByZXF1aXJlKCJwbGF5ZXIiKQ0KICAgIHBsYXllci5tb3ZlKDEw
+LCAyMCkNCiAgICBwcmludCgiUGxheWVyIGhlYWx0aDogIiAuLiBwbGF5ZXIuaGVhbHRoKQ0KICAg
+IHBsYXllci50YWtlX2RhbWFnZSg1KQ0KICAgIHByaW50KCJQbGF5ZXIgaGVhbHRoIGFmdGVyIGRh
+bWFnZTogIiAuLiBwbGF5ZXIuaGVhbHRoKQ0KICAgIGBgYA0KDQo0LiAqKkFkZGluZyBDdXN0b20g
+U2VhcmNoIFBhdGhzKio6DQogICAgRGVmaW5lIGFkZGl0aW9uYWwgc2VhcmNoIHBhdGhzIHRvIG9y
+Z2FuaXplIHlvdXIgbW9kdWxlcyBpbiBkaWZmZXJlbnQgZGlyZWN0b3JpZXMuDQoNCiAgICBFeGFt
+cGxlOg0KICAgIGBgYGx1YQ0KICAgIGFkZF9tb2R1bGVfcGF0aCgiL2FkZGl0aW9uYWxfbW9kdWxl
+X2RpcmVjdG9yeS8iKQ0KICAgIGBgYA0KDQo1LiAqKkNsZWFyaW5nIHRoZSBNb2R1bGUgQ2FjaGUq
+KjoNCiAgICBDbGVhciB0aGUgbW9kdWxlIGNhY2hlIHRvIHJlbG9hZCBzcGVjaWZpYyBtb2R1bGVz
+LCB3aGljaCBpcyB1c2VmdWwgZHVyaW5nIHRlc3RpbmcuDQoNCiAgICBFeGFtcGxlOg0KICAgIGBg
+YGx1YQ0KICAgIGNsZWFyX21vZHVsZV9jYWNoZSh7ICJsb2ciIH0pICAtLSBDbGVhcnMgYWxsIGNh
+Y2hlZCBtb2R1bGVzIGV4Y2VwdCB0aGUgbG9nIG1vZHVsZQ0KICAgIGBgYA0KDQo2LiAqKk1vY2sg
+TW9kdWxlcyBmb3IgVGVzdGluZyoqOg0KICAgIExvYWQgbW9jayB2ZXJzaW9ucyBvZiBtb2R1bGVz
+IGR1cmluZyB0ZXN0aW5nIGJ5IHVzaW5nIGFsaWFzZXMsIGFsbG93aW5nIHlvdSB0byBzaW11bGF0
+ZSBiZWhhdmlvciB3aXRob3V0IGFmZmVjdGluZyB0aGUgYWN0dWFsIGdhbWUuDQoNCiAgICBFeGFt
+cGxlOg0KICAgIGBgYGx1YQ0KICAgIGxvY2FsIGxvZyA9IHJlcXVpcmUoIm1vY2tfbG9nIiwgImxv
+ZyIpICAtLSBNb2NrIGxvZyBtb2R1bGUgdW5kZXIgdGhlIHJlYWwgbG9nIGFsaWFzDQogICAgbG9n
+LmluZm8oIlRlc3Rpbmcgc3RhcnRlZCIpDQogICAgYGBgDQ==
+:: src/.info.pod
+--[[pod,created="2025-11-07 22:14:13",modified="2025-11-18 18:11:48"]]
+:: src/procgen/.info.pod
+--[[pod,created="2025-11-18 15:42:40",modified="2025-11-18 18:11:48"]]
+:: src/procgen/dungeon/.info.pod
+--[[pod,created="2025-11-18 15:42:40",modified="2025-11-18 18:11:48"]]
+:: src/render/.info.pod
+--[[pod,created="2025-11-18 15:42:40",modified="2025-11-18 18:11:48"]]
+:: [eoc]

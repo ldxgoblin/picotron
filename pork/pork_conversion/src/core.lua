@@ -90,7 +90,7 @@ function startgame()
  talkwind=nil
  
  hpwind=addwind(5,5,28,13,{})
- 
+
  thrdx,thrdy=0,-1
  
  _upd=update_game
